@@ -1081,9 +1081,14 @@ fn keyCallback(_: ?*c.GLFWwindow, key: c_int, _: c_int, action: c_int, mods: c_i
     }
 
     if (g_pty) |pty| {
-        // Scroll viewport to bottom when typing (except for scroll keys)
+        // Scroll viewport to bottom when typing (except for scroll keys and modifier-only presses)
+        // This matches Ghostty's behavior: only scroll for non-modifier keys
         const is_scroll_key = shift and (key == c.GLFW_KEY_PAGE_UP or key == c.GLFW_KEY_PAGE_DOWN);
-        if (!is_scroll_key) {
+        const is_modifier = key == c.GLFW_KEY_LEFT_SHIFT or key == c.GLFW_KEY_RIGHT_SHIFT or
+            key == c.GLFW_KEY_LEFT_CONTROL or key == c.GLFW_KEY_RIGHT_CONTROL or
+            key == c.GLFW_KEY_LEFT_ALT or key == c.GLFW_KEY_RIGHT_ALT or
+            key == c.GLFW_KEY_LEFT_SUPER or key == c.GLFW_KEY_RIGHT_SUPER;
+        if (!is_scroll_key and !is_modifier) {
             if (g_terminal) |term| {
                 term.scrollViewport(.bottom) catch {};
             }
