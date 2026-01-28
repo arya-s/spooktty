@@ -101,6 +101,8 @@ var g_selection: Selection = .{
     .active = false,
 };
 var g_selecting: bool = false; // True while mouse button is held
+var g_click_x: f64 = 0; // X position of initial click (for threshold calculation)
+var g_click_y: f64 = 0; // Y position of initial click
 
 // Embed the font
 const font_data = @embedFile("fonts/JetBrainsMono-Regular.ttf");
@@ -897,23 +899,18 @@ fn mouseButtonCallback(window: ?*c.GLFWwindow, button: c_int, action: c_int, _: 
         const cell = mouseToCell(xpos, ypos);
         
         if (action == c.GLFW_PRESS) {
-            // Start selection
+            // Start selection - record click position for threshold calculation
             g_selection.start_col = cell.col;
             g_selection.start_row = cell.row;
             g_selection.end_col = cell.col;
             g_selection.end_row = cell.row;
-            g_selection.active = true;
+            g_selection.active = false; // Don't activate until we confirm it's a real selection
             g_selecting = true;
+            g_click_x = xpos;
+            g_click_y = ypos;
         } else if (action == c.GLFW_RELEASE) {
             g_selecting = false;
-            // Single click clears selection, drag keeps it for manual copy
-            if (g_selection.active) {
-                const same_cell = (g_selection.start_col == g_selection.end_col and 
-                                   g_selection.start_row == g_selection.end_row);
-                if (same_cell) {
-                    g_selection.active = false;
-                }
-            }
+            // Selection remains active if it was activated during drag
         }
     }
 }
@@ -924,6 +921,27 @@ fn cursorPosCallback(_: ?*c.GLFWwindow, xpos: f64, ypos: f64) callconv(.c) void 
         const cell = mouseToCell(xpos, ypos);
         g_selection.end_col = cell.col;
         g_selection.end_row = cell.row;
+        
+        // Use threshold-based selection like Ghostty (60% of cell width)
+        // This determines if we've dragged enough to create a real selection
+        const threshold = cell_width * 0.6;
+        const padding: f64 = 10;
+        
+        // Calculate position within cells
+        const click_cell_x = g_click_x - padding - @as(f64, @floatFromInt(g_selection.start_col)) * @as(f64, cell_width);
+        const drag_cell_x = xpos - padding - @as(f64, @floatFromInt(cell.col)) * @as(f64, cell_width);
+        
+        const same_cell = (g_selection.start_col == cell.col and g_selection.start_row == cell.row);
+        
+        if (same_cell) {
+            // Same cell - check if we've crossed the threshold in either direction
+            const moved_right = drag_cell_x >= threshold and click_cell_x < threshold;
+            const moved_left = drag_cell_x < threshold and click_cell_x >= threshold;
+            g_selection.active = moved_right or moved_left;
+        } else {
+            // Different cells - always activate selection
+            g_selection.active = true;
+        }
     }
 }
 
