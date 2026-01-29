@@ -270,6 +270,13 @@ var cursor_height: f32 = 16; // Height of cursor (ascender portion)
 var box_thickness: u32 = 1; // Thickness for box drawing characters
 var window_focused: bool = true; // Track window focus state
 
+// Fullscreen state (Alt+Enter to toggle)
+var g_is_fullscreen: bool = false;
+var g_windowed_x: c_int = 0; // Saved windowed position/size for restore
+var g_windowed_y: c_int = 0;
+var g_windowed_width: c_int = 800;
+var g_windowed_height: c_int = 600;
+
 // Pending resize state (resize is deferred to main loop to avoid PageList integrity issues)
 // Ghostty coalesces resize events with a 25ms timer to batch rapid resizes
 var g_pending_resize: bool = false;
@@ -1344,6 +1351,50 @@ fn scrollCallback(_: ?*c.GLFWwindow, _: f64, yoffset: f64) callconv(.c) void {
     }
 }
 
+/// Toggle between windowed and borderless fullscreen (like Alt+Enter in many apps)
+fn toggleFullscreen() void {
+    const window = g_window orelse return;
+
+    if (g_is_fullscreen) {
+        // Restore windowed mode with saved position and size
+        c.glfwSetWindowMonitor(
+            window,
+            null, // no monitor = windowed
+            g_windowed_x,
+            g_windowed_y,
+            g_windowed_width,
+            g_windowed_height,
+            c.GLFW_DONT_CARE,
+        );
+        g_is_fullscreen = false;
+        std.debug.print("Exited fullscreen (restored {}x{} at {},{})\n", .{
+            g_windowed_width, g_windowed_height, g_windowed_x, g_windowed_y,
+        });
+    } else {
+        // Save current windowed position and size before going fullscreen
+        c.glfwGetWindowPos(window, &g_windowed_x, &g_windowed_y);
+        c.glfwGetWindowSize(window, &g_windowed_width, &g_windowed_height);
+
+        // Get the monitor the window is currently on
+        const monitor = c.glfwGetPrimaryMonitor() orelse return;
+        const mode = c.glfwGetVideoMode(monitor) orelse return;
+
+        c.glfwSetWindowMonitor(
+            window,
+            monitor,
+            0,
+            0,
+            mode.*.width,
+            mode.*.height,
+            mode.*.refreshRate,
+        );
+        g_is_fullscreen = true;
+        std.debug.print("Entered fullscreen ({}x{} @{}Hz)\n", .{
+            mode.*.width, mode.*.height, mode.*.refreshRate,
+        });
+    }
+}
+
 // GLFW key callback - handles special keys
 fn keyCallback(_: ?*c.GLFWwindow, key: c_int, _: c_int, action: c_int, mods: c_int) callconv(.c) void {
     if (action != c.GLFW_PRESS and action != c.GLFW_REPEAT) return;
@@ -1360,6 +1411,13 @@ fn keyCallback(_: ?*c.GLFWwindow, key: c_int, _: c_int, action: c_int, mods: c_i
     // Ctrl+Shift+V = Paste
     if (ctrl and shift and key == c.GLFW_KEY_V) {
         pasteFromClipboard();
+        return;
+    }
+
+    // Alt+Enter = Toggle fullscreen
+    const alt = (mods & c.GLFW_MOD_ALT) != 0;
+    if (alt and key == c.GLFW_KEY_ENTER) {
+        toggleFullscreen();
         return;
     }
 
