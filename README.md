@@ -37,8 +37,8 @@ zig build -Doptimize=ReleaseFast   # release
 phantty.exe [options]
 
 Options:
-  --font, -f <name>            Set font (default: JetBrains Mono)
-  --font-style <style>         Font weight (default: semi-bold)
+  --font, -f <name>            Set font (default: embedded fallback)
+  --font-style <style>         Font weight (default: regular)
                                 Options: thin, extra-light, light, regular,
                                          medium, semi-bold, bold, extra-bold, black
   --cursor-style <style>       Cursor shape (default: block)
@@ -80,9 +80,9 @@ config-file = extra.conf
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `font-family` | `JetBrains Mono` | Font family name |
-| `font-style` | `semi-bold` | Font weight: `thin`, `extra-light`, `light`, `regular`, `medium`, `semi-bold`, `bold`, `extra-bold`, `black` |
-| `font-size` | `14` | Font size in points |
+| `font-family` | *(none)* | Font family name (falls back to embedded font if unset) |
+| `font-style` | `regular` | Font weight: `thin`, `extra-light`, `light`, `regular`, `medium`, `semi-bold`, `bold`, `extra-bold`, `black` |
+| `font-size` | `12` | Font size in points |
 | `cursor-style` | `block` | Cursor shape: `block`, `bar`, `underline`, `block_hollow` |
 | `cursor-style-blink` | `true` | Enable cursor blinking |
 | `theme` | *(Poimandres)* | Theme name (from `themes/` directory) or file path |

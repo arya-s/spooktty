@@ -178,14 +178,15 @@ pub const FontWeight = enum {
 // Config Fields
 // ============================================================================
 
-/// Font family name.
-@"font-family": []const u8 = "JetBrains Mono",
+/// Font family name. Ghostty default: unset (system default).
+/// We default to an empty string meaning "use system default".
+@"font-family": []const u8 = "",
 
-/// Font weight/style.
-@"font-style": FontWeight = .semi_bold,
+/// Font weight/style. Ghostty default: regular (default).
+@"font-style": FontWeight = .regular,
 
-/// Font size in points.
-@"font-size": u32 = 14,
+/// Font size in points. Ghostty default: 13 (macOS), 12 (other).
+@"font-size": u32 = 12,
 
 /// Cursor shape: block, bar, underline, block_hollow.
 @"cursor-style": CursorStyle = .block,

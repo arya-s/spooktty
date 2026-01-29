@@ -1794,11 +1794,15 @@ pub fn main() !void {
     var font_result: ?directwrite.FontDiscovery.FontResult = null;
 
     if (dw_discovery) |*dw| {
-        if (dw.findFontFilePath(allocator, requested_font, requested_weight, .NORMAL) catch null) |result| {
-            font_result = result;
-            std.debug.print("Found system font: {s}\n", .{result.path});
+        if (requested_font.len > 0) {
+            if (dw.findFontFilePath(allocator, requested_font, requested_weight, .NORMAL) catch null) |result| {
+                font_result = result;
+                std.debug.print("Found system font: {s}\n", .{result.path});
+            } else {
+                std.debug.print("Font '{s}' not found, will use embedded fallback\n", .{requested_font});
+            }
         } else {
-            std.debug.print("Font '{s}' not found, will use embedded fallback\n", .{requested_font});
+            std.debug.print("No font-family set, will use embedded fallback\n", .{});
         }
     }
 
