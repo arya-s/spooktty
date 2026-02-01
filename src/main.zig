@@ -3123,14 +3123,32 @@ pub fn main() !void {
     // Set initial cursor blink mode (Ghostty defaults to true in Termio.zig:219)
     terminal.modes.set(.cursor_blinking, g_cursor_blink);
 
-    // Spawn PTY with wsl.exe
-    const wsl_cmd = std.unicode.utf8ToUtf16LeStringLiteral("wsl.exe");
-    var pty = Pty.spawn(term_cols, term_rows, wsl_cmd) catch |err| {
-        std.debug.print("Failed to spawn PTY: {}\n", .{err});
+    // Resolve shell from config
+    const shell_cmd: [:0]const u16 = blk: {
+        const cmd = cfg.shell;
+        if (std.mem.eql(u8, cmd, "cmd")) {
+            break :blk std.unicode.utf8ToUtf16LeStringLiteral("cmd.exe");
+        } else if (std.mem.eql(u8, cmd, "powershell")) {
+            break :blk std.unicode.utf8ToUtf16LeStringLiteral("powershell.exe");
+        } else if (std.mem.eql(u8, cmd, "pwsh")) {
+            break :blk std.unicode.utf8ToUtf16LeStringLiteral("pwsh.exe");
+        } else if (std.mem.eql(u8, cmd, "wsl")) {
+            break :blk std.unicode.utf8ToUtf16LeStringLiteral("wsl.exe");
+        } else {
+            // Raw command path — convert UTF-8 to UTF-16
+            var buf: [256]u16 = undefined;
+            const len = std.unicode.utf8ToUtf16Le(&buf, cmd) catch 0;
+            buf[len] = 0;
+            break :blk buf[0..len :0];
+        }
+    };
+
+    var pty = Pty.spawn(term_cols, term_rows, shell_cmd) catch |err| {
+        std.debug.print("Failed to spawn PTY with shell '{s}': {}\n", .{ cfg.shell, err });
         return err;
     };
     defer pty.deinit();
-    std.debug.print("PTY spawned with wsl.exe\n", .{});
+    std.debug.print("PTY spawned with shell '{s}'\n", .{cfg.shell});
 
     // Set some global pointers for callbacks (window set later)
     g_pty = &pty;

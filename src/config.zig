@@ -211,6 +211,14 @@ theme: ?[]const u8 = null,
 /// Scrollback buffer limit in bytes.
 @"scrollback-limit": u32 = 10_000_000,
 
+/// The shell to run in the terminal. Accepted values:
+///   - "cmd" — run Command Prompt (cmd.exe, default)
+///   - "powershell" — run Windows PowerShell (powershell.exe)
+///   - "pwsh" — run PowerShell 7+ (pwsh.exe)
+///   - "wsl" — run Windows Subsystem for Linux (wsl.exe)
+///   - Any other value is treated as a raw command path
+shell: []const u8 = "cmd",
+
 /// Load an additional config file. Can be repeated. Relative paths are
 /// resolved relative to the file containing the directive. Prefix with
 /// `?` to make optional (missing file is silently ignored).
@@ -415,6 +423,8 @@ fn applyKeyValue(self: *Config, allocator: std.mem.Allocator, key: []const u8, v
             log.warn("invalid scrollback-limit: {s}", .{value});
             return;
         };
+    } else if (std.mem.eql(u8, key, "shell")) {
+        self.shell = self.dupeString(allocator, value) orelse return;
     } else if (std.mem.eql(u8, key, "config-file")) {
         self.loadConfigFileDirective(allocator, value, base_dir);
     } else {
@@ -727,6 +737,9 @@ const default_config_template =
     \\# Window
     \\# window-height = 28
     \\# window-width = 110
+    \\
+    \\# Shell (cmd, powershell, pwsh, wsl, or a custom path)
+    \\# shell = cmd
     \\
     \\# Scrollback buffer size in bytes (default: 10MB)
     \\# scrollback-limit = 10000000
