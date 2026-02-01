@@ -1,13 +1,13 @@
 # Phantty UI Framework Plan
 
-## Status: APPROVED — Ready for implementation
+## Status: Phase 1 nearly complete, Phase 4 partially done
 
 ## Development Workflow
 
 - **Build environment**: WSL (Linux) cross-compiling to `x86_64-windows`
-- **Build command**: `make debug` builds **both** `phantty-glfw.exe` and `phantty-win32.exe`. Use `make debug-win32` or `make debug-glfw` to build a single backend. Never `make release` (that's for humans shipping).
+- **Build command**: `make debug` builds `phantty.exe` (Win32 backend only). Never `make release` (that's for humans shipping).
 - **Running**: The built `.exe` is accessible directly from Windows (WSL filesystem) — no copy step needed
-- **Build-and-validate cadence**: Build often, validate often. **Every build must run without crashing.** After any meaningful change, do `make debug` and confirm both exes launch and render correctly on Windows. Prompt for a build test regularly — don't let changes pile up untested.
+- **Build-and-validate cadence**: Build often, validate often. **Every build must run without crashing.** After any meaningful change, do `make debug` and confirm the exe launches and renders correctly on Windows. Prompt for a build test regularly — don't let changes pile up untested.
 - **No big bangs**: If a change touches rendering, input, or windowing, build and test before moving on. Small steps.
 
 ## Decisions
@@ -137,23 +137,38 @@ A terminal has very few traditional UI controls:
 **OpenGL Bridge (temporary)**
 - [x] Set up OpenGL 3.3 core context on Win32 HWND via WGL bootstrap (dummy window → `wglCreateContextAttribsARB`)
 - [x] Port existing GLFW render loop to Win32 message pump (shared rendering code works)
-- [ ] Verify existing rendering works identically (needs human test on Windows)
+- [x] Verify existing rendering works identically
 
 **Custom Title Bar**
 - [x] Extend frame into client area via `DwmExtendFrameIntoClientArea` (cyTopHeight=-1)
-- [x] Handle `WM_NCCALCSIZE` to remove default title bar (preserves resize borders)
+- [x] Handle `WM_NCCALCSIZE` to remove default title bar (preserves resize borders, proper maximized inset)
 - [x] Handle `WM_NCHITTEST` for resize borders, caption area, min/max/close buttons (snap layouts)
-- [x] Terminal content offset below titlebar area (40px)
-- [x] Titlebar background + separator line + active tab indicator (OpenGL quads)
-- [x] Tab title text rendering ("Phantty") using existing glyph renderer
-- [ ] Proper tab bar: new-tab (+) button, close button (Phase 4)
-- [ ] Chrome/Windows Terminal-style rounded tab appearance (Phase 4, Direct2D)
+- [x] Terminal content offset below titlebar area (34px, matches Explorer)
+- [x] Titlebar background + active tab indicator (OpenGL quads)
+- [x] Tab title text rendering with UTF-8 support, fixed 14pt size
+- [x] 1px focus border (terminal bg color) when window is active
+- [x] Caption buttons: Segoe MDL2 Assets icon font (minimize, maximize, restore, close) with DPI-aware sizing
+- [x] Caption button hover states (subtle fill for min/max, red #C42B1C for close, 1px inset on close for focus border)
+- [x] Caption buttons fire on mouse-up, drag-away cancels
+- [x] Maximize button shows restore icon when maximized or fullscreen; click exits fullscreen
+- [x] Ghostty-style tab bar: equal-width tabs, active = terminal bg, inactive = bg+0.05 with bottom border
+- [x] Tab shortcuts (^1–^9, ^0) right-aligned, dimmed on inactive tabs
+- [x] New-tab (+) button with Segoe MDL2 AddBold icon, same size/color as caption buttons
+- [x] Middle-click tab to close
+- [x] Double-click tab to maximize/restore (suppressed on + button)
+- [x] Single-tab titlebar: drag to move, double-click to maximize
+- [x] Multi-tab titlebar: tab area clickable, gap area draggable
+- [x] Tab title from OSC 0/2/7 with shell-friendly names and middle ellipsis truncation
+- [ ] Chrome/Windows Terminal-style rounded tab appearance (deferred to Direct2D phase)
 
 **Build System**
-- [x] Add build flag: `-Dbackend=win32` vs `-Dbackend=glfw` (default: glfw during transition)
+- [x] Win32-only build (`make debug` produces `phantty.exe`). GLFW backend removed.
 - [ ] Vendor Flow editor Win32/D3D11 pieces with attribution (deferred to Phase 2)
 
-**Deliverable**: Phantty runs on a native Win32 window with a custom title bar showing one tab. Same terminal rendering. GLFW still works as fallback.
+**Config**
+- [x] `shell` setting: cmd (default), powershell, pwsh, wsl, or custom path
+
+**Deliverable**: Phantty runs on a native Win32 window with custom title bar, Ghostty-style tab bar, and Segoe MDL2 caption button icons. Explorer-matching chrome. ~~GLFW still works as fallback.~~
 
 ### Phase 2: Direct3D 11 Renderer (Replace OpenGL)
 > **Goal**: GPU-accelerated tile-based terminal rendering.
@@ -187,15 +202,20 @@ A terminal has very few traditional UI controls:
 ### Phase 4: Tab Management
 > **Goal**: Full tabbed terminal experience matching Chrome/Windows Terminal.
 
-- [ ] Tab model: each tab owns a terminal instance + PTY
-- [ ] New tab: `Ctrl+T` or click (+) button
-- [ ] Close tab: `Ctrl+W` or click (✕) on tab, confirm if process running
-- [ ] Switch tabs: `Ctrl+Tab` / `Ctrl+Shift+Tab` / `Ctrl+1-9`
+**Done (implemented early in Phase 1):**
+- [x] Tab model: placeholder tabs + terminal tab (g_tabs array, max 16)
+- [x] New tab: `Ctrl+Shift+T` or click (+) button
+- [x] Close tab: `Ctrl+W`, middle-click, or close any tab (adjusts active index correctly)
+- [x] Switch tabs: `Ctrl+Tab` / `Ctrl+Shift+Tab` / `Ctrl+1-9`
+- [x] Tab title from shell (OSC 0/2/7 sequences, shell-friendly names, ~/ substitution)
+
+**Remaining:**
+- [ ] Each tab owns its own terminal instance + PTY (currently only tab 0 is a real terminal)
 - [ ] Reorder tabs: drag and drop
 - [ ] Tab overflow: scroll or dropdown when too many tabs
 - [ ] Right-click tab context menu (close, close others, duplicate, rename)
 - [ ] New tab shell picker (cmd, powershell, WSL profiles)
-- [ ] Tab title from shell (OSC 0/2 sequences)
+- [ ] Confirm close if process running
 
 **Deliverable**: Full tabbed terminal. Multiple concurrent sessions.
 
