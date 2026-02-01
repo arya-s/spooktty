@@ -1076,7 +1076,7 @@ fn renderTitlebar(window_width: f32, window_height: f32, titlebar_h: f32) void {
     // Layout constants
     const caption_btn_w: f32 = 46;
     const caption_area_w: f32 = caption_btn_w * 3; // min + max + close
-    const plus_btn_w: f32 = 40; // + button width
+    const plus_btn_w: f32 = 46; // + button width (same as caption buttons)
     const gap_w: f32 = 42; // breathing room between + and caption buttons
     const show_plus = g_tab_count > 1;
     const num_tabs = g_tab_count;
@@ -1117,8 +1117,7 @@ fn renderTitlebar(window_width: f32, window_height: f32, titlebar_h: f32) void {
             } else inactive_tab_bg;
             renderQuad(cursor_x, tb_top, tab_w, titlebar_h, tab_bg);
 
-            // 1px inset border — left border only (skip on first tab), top, bottom
-            renderQuad(cursor_x, tb_top + titlebar_h - bdr, tab_w, bdr, border_color); // top
+            // 1px inset border — left border only (skip on first tab), bottom
             renderQuad(cursor_x, tb_top, tab_w, bdr, border_color); // bottom
             if (tab_idx > 0) {
                 renderQuad(cursor_x, tb_top, bdr, titlebar_h, border_color); // left
@@ -1247,7 +1246,6 @@ fn renderTitlebar(window_width: f32, window_height: f32, titlebar_h: f32) void {
 
         if (plus_hovered) {
             renderQuad(cursor_x, tb_top, plus_btn_w, titlebar_h, inactive_tab_bg);
-            renderQuad(cursor_x, tb_top + titlebar_h - bdr, plus_btn_w, bdr, border_color); // top
             renderQuad(cursor_x, tb_top, plus_btn_w, bdr, border_color); // bottom
         }
 
@@ -1304,6 +1302,21 @@ fn renderTitlebar(window_width: f32, window_height: f32, titlebar_h: f32) void {
     renderCaptionButton(caption_start, tb_top, caption_btn_w, btn_h, .minimize, hovered == .minimize);
     renderCaptionButton(caption_start + caption_btn_w, tb_top, caption_btn_w, btn_h, .maximize, hovered == .maximize);
     renderCaptionButton(caption_start + caption_btn_w * 2, tb_top, caption_btn_w, btn_h, .close, hovered == .close);
+
+    // --- Focus border: 1px accent border when window is focused (matches Explorer/DWM) ---
+    if (build_options.use_win32) {
+        const is_focused = if (g_window) |w| w.focused else false;
+        const is_maximized = if (g_window) |w| win32_backend.IsZoomed(w.hwnd) != 0 else false;
+        if (is_focused and !is_maximized) {
+            // Same color as active tab (terminal background)
+            const accent = bg;
+            const b: f32 = 1; // 1px border
+            renderQuad(0, 0, window_width, b, accent); // bottom
+            renderQuad(0, window_height - b, window_width, b, accent); // top
+            renderQuad(0, 0, b, window_height, accent); // left
+            renderQuad(window_width - b, 0, b, window_height, accent); // right
+        }
+    }
 }
 
 const CaptionButtonType = enum { minimize, maximize, close };
@@ -1315,9 +1328,8 @@ const CaptionButtonType = enum { minimize, maximize, close };
 ///   - Hover (min/max): subtle light fill bg, white icon
 ///   - Hover (close): red #C42B1C bg, white icon
 fn renderCaptionButton(x: f32, y: f32, w: f32, h: f32, btn_type: CaptionButtonType, hovered: bool) void {
-    // Draw hover background with inset padding (matches Explorer)
+    // Draw hover background, respecting the 1px focus border on edges
     if (hovered) {
-        const pad: f32 = 2;
         const hover_bg = switch (btn_type) {
             .close => [3]f32{ 0.77, 0.17, 0.11 }, // #C42B1C
             else => [3]f32{
@@ -1326,22 +1338,41 @@ fn renderCaptionButton(x: f32, y: f32, w: f32, h: f32, btn_type: CaptionButtonTy
                 @min(1.0, g_theme.background[2] + 0.05),
             },
         };
-        renderQuad(x + pad, y + pad, w - pad * 2, h - pad * 2, hover_bg);
+        // Close button is at the window edge — inset by 1px on top/right
+        // to respect the focus border (matches Explorer behavior)
+        if (btn_type == .close) {
+            const is_focused = if (build_options.use_win32)
+                (if (g_window) |win| win.focused else false)
+            else
+                false;
+            const is_maximized = if (build_options.use_win32)
+                (if (g_window) |win| win32_backend.IsZoomed(win.hwnd) != 0 else false)
+            else
+                false;
+            const b: f32 = if (is_focused and !is_maximized) 1 else 0;
+            renderQuad(x, y + b, w - b, h - b, hover_bg);
+        } else {
+            renderQuad(x, y, w, h, hover_bg);
+        }
     }
 
     // Icon color: white when hovered, light gray otherwise
     const icon_color: [3]f32 = if (hovered) .{ 1.0, 1.0, 1.0 } else .{ 0.75, 0.75, 0.75 };
 
-    // Check if window is maximized (for restore icon)
+    // Check if window is maximized or fullscreen (for restore icon)
     const is_maximized = if (build_options.use_win32)
         (if (g_window) |win| win32_backend.IsZoomed(win.hwnd) != 0 else false)
+    else
+        false;
+    const is_fullscreen = if (build_options.use_win32)
+        (if (g_window) |win| win.is_fullscreen else false)
     else
         false;
 
     // Segoe MDL2 Assets glyph codepoints (same as Windows Terminal)
     const icon_codepoint: u32 = switch (btn_type) {
         .close => 0xE8BB,
-        .maximize => if (is_maximized) @as(u32, 0xE923) else @as(u32, 0xE922),
+        .maximize => if (is_maximized or is_fullscreen) @as(u32, 0xE923) else @as(u32, 0xE922),
         .minimize => 0xE921,
     };
 
@@ -2737,7 +2768,7 @@ const win32_input = if (build_options.use_win32) struct {
 
         const caption_area_w: f64 = 46 * 3;
         const gap_w: f64 = 42;
-        const plus_btn_w: f64 = 40;
+        const plus_btn_w: f64 = 46;
         const show_plus = g_tab_count > 1;
         const num_tabs = g_tab_count;
 
@@ -2772,7 +2803,7 @@ const win32_input = if (build_options.use_win32) struct {
 
         const caption_area_w: f64 = 46 * 3;
         const gap_w: f64 = 42;
-        const plus_btn_w: f64 = 40;
+        const plus_btn_w: f64 = 46;
         const show_plus = g_tab_count > 1;
         const num_tabs = g_tab_count;
 
@@ -2801,7 +2832,7 @@ const win32_input = if (build_options.use_win32) struct {
 
         const caption_area_w: f64 = 46 * 3;
         const gap_w: f64 = 42;
-        const plus_btn_w: f64 = 40;
+        const plus_btn_w: f64 = 46;
         if (g_tab_count <= 1) return false;
 
         const right_reserved: f64 = caption_area_w + gap_w + plus_btn_w;
@@ -2955,6 +2986,7 @@ const win32_input = if (build_options.use_win32) struct {
                 0x0020 | 0x0040, // SWP_FRAMECHANGED | SWP_SHOWWINDOW
             );
             is_fullscreen = false;
+            if (g_window) |w| w.is_fullscreen = false;
             std.debug.print("Exited fullscreen\n", .{});
         } else {
             // Save current state
@@ -2978,6 +3010,7 @@ const win32_input = if (build_options.use_win32) struct {
                 );
             }
             is_fullscreen = true;
+            if (g_window) |w| w.is_fullscreen = true;
             std.debug.print("Entered fullscreen\n", .{});
         }
     }

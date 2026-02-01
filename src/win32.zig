@@ -361,7 +361,7 @@ const DWMWA_USE_IMMERSIVE_DARK_MODE: DWORD = 20;
 /// Height of the custom title bar area in pixels.
 /// This is where tabs will eventually be drawn.
 /// Windows Terminal uses ~40px at 96 DPI. We match that.
-pub const TITLEBAR_HEIGHT: i32 = 40;
+pub const TITLEBAR_HEIGHT: i32 = 34;
 
 // PM_REMOVE for PeekMessage
 const PM_REMOVE: UINT = 0x0001;
@@ -449,6 +449,7 @@ pub const Window = struct {
     width: i32 = 800,
     height: i32 = 600,
     focused: bool = true,
+    is_fullscreen: bool = false,
 
     // Custom title bar
     titlebar_height: i32 = TITLEBAR_HEIGHT,
@@ -878,15 +879,19 @@ fn wndProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.wina
         // --- Custom title bar: remove default title bar ---
         WM_NCCALCSIZE => {
             if (wParam == 1) {
-                // Returning 0 without calling DefWindowProc tells Windows:
-                // "the entire window rect is client area" — no title bar, no borders.
-                // Our WM_NCHITTEST handler provides the resize borders and caption.
-                //
-                // When maximized, we need to inset the top by the resize border
-                // thickness so the content isn't hidden behind the taskbar.
-                if (IsZoomed(hwnd) != 0) {
+                // Remove all non-client area (no default title bar or borders).
+                // Our WM_NCHITTEST handler provides resize borders and caption.
+                if (IsZoomed(hwnd) != 0 and !w.is_fullscreen) {
+                    // Maximized (not fullscreen): Windows extends the window
+                    // beyond the screen by the resize border thickness on all
+                    // sides. Inset all edges so content isn't clipped behind
+                    // screen edges/taskbar.
                     const params: *NCCALCSIZE_PARAMS = @ptrFromInt(@as(usize, @bitCast(lParam)));
-                    params.rgrc[0].top += getResizeBorderThickness();
+                    const border = getResizeBorderThickness();
+                    params.rgrc[0].top += border;
+                    params.rgrc[0].left += border;
+                    params.rgrc[0].right -= border;
+                    params.rgrc[0].bottom -= border;
                 }
                 return 0;
             }
@@ -1022,7 +1027,11 @@ fn wndProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.wina
                         return 0;
                     },
                     .maximize => {
-                        if (IsZoomed(hwnd) != 0) {
+                        if (w.is_fullscreen) {
+                            // Exit fullscreen → restore to windowed size
+                            // Push a synthetic key event for Alt+Enter
+                            w.key_events.push(.{ .vk = VK_RETURN, .alt = true, .ctrl = false, .shift = false });
+                        } else if (IsZoomed(hwnd) != 0) {
                             _ = ShowWindow(hwnd, SW_RESTORE);
                         } else {
                             _ = ShowWindow(hwnd, SW_MAXIMIZE);
