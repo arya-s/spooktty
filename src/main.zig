@@ -318,6 +318,7 @@ fn addPlaceholderTab() void {
     g_tabs[g_tab_count] = .{ .kind = .placeholder, .title = "New Tab" };
     g_active_tab = g_tab_count;
     g_tab_count += 1;
+
     std.debug.print("New tab created ({}), active: {}\n", .{ g_tab_count, g_active_tab });
 }
 
@@ -1125,17 +1126,47 @@ fn renderTitlebar(window_width: f32, window_height: f32, titlebar_h: f32) void {
         }
 
         // Tab title text — centered, scaled down to ~75% of terminal font
+        // Shortcut label (^1 through ^0) rendered right-aligned, only for tabs 1–10 in multi-tab
         const title = g_tabs[tab_idx].title;
         if (title.len > 0) {
             const text_color = if (is_active) text_active else text_inactive;
+            const shortcut_color = [3]f32{ 0.45, 0.45, 0.45 }; // dimmer than inactive text
             const text_scale: f32 = 0.75;
             const scaled_height = cell_height * text_scale;
-            const tab_pad: f32 = 18; // padding on each side (matches caption button padding)
+            const tab_pad: f32 = 18; // padding on each side
+
+            // Shortcut label: "^1" through "^9", "^0" for tab 10, only in multi-tab
+            const has_shortcut = num_tabs > 1 and tab_idx < 10;
+            const shortcut_digit: u8 = if (has_shortcut)
+                (if (tab_idx == 9) '0' else @as(u8, @intCast('1' + tab_idx)))
+            else
+                0;
+
+            // Measure shortcut width: "^" + digit
+            var shortcut_w: f32 = 0;
+            if (has_shortcut) {
+                // ^ character
+                if (loadGlyph('^')) |glyph| {
+                    shortcut_w += @as(f32, @floatFromInt(glyph.advance >> 6)) * text_scale;
+                } else {
+                    shortcut_w += cell_width * text_scale;
+                }
+                // digit
+                if (loadGlyph(@intCast(shortcut_digit))) |glyph| {
+                    shortcut_w += @as(f32, @floatFromInt(glyph.advance >> 6)) * text_scale;
+                } else {
+                    shortcut_w += cell_width * text_scale;
+                }
+            }
+
+            // Reserve space for shortcut on the right (with padding gap)
+            const shortcut_gap: f32 = if (has_shortcut) 6 else 0; // gap between title and shortcut
+            const shortcut_reserved = if (has_shortcut) shortcut_w + shortcut_gap else 0;
 
             // Available width for text inside the tab
             const center_region = if (num_tabs == 1) window_width else tab_w;
             const center_offset = if (num_tabs == 1) @as(f32, 0) else cursor_x;
-            const avail_w = center_region - tab_pad * 2;
+            const avail_w = center_region - tab_pad * 2 - shortcut_reserved;
 
             // Measure full text width (use loadGlyph to ensure glyphs are cached)
             var text_width: f32 = 0;
@@ -1150,8 +1181,9 @@ fn renderTitlebar(window_width: f32, window_height: f32, titlebar_h: f32) void {
             const text_y = tb_top + (titlebar_h - scaled_height) / 2;
 
             if (text_width <= avail_w) {
-                // Fits — center it
-                var text_x = center_offset + (center_region - text_width) / 2;
+                // Fits — center it within the available area (excluding shortcut)
+                const text_area = center_region - shortcut_reserved;
+                var text_x = center_offset + (text_area - text_width) / 2;
                 for (title) |ch| {
                     renderCharScaled(@intCast(ch), text_x, text_y, text_color, text_scale);
                     if (loadGlyph(@intCast(ch))) |glyph| {
@@ -1226,6 +1258,19 @@ fn renderTitlebar(window_width: f32, window_height: f32, titlebar_h: f32) void {
                     }
                 }
             }
+
+            // Render shortcut label right-aligned: "^1", "^2", etc.
+            if (has_shortcut) {
+                const sc_color = if (is_active) text_active else shortcut_color;
+                var sc_x = center_offset + center_region - tab_pad - shortcut_w;
+                renderCharScaled('^', sc_x, text_y, sc_color, text_scale);
+                if (loadGlyph('^')) |glyph| {
+                    sc_x += @as(f32, @floatFromInt(glyph.advance >> 6)) * text_scale;
+                } else {
+                    sc_x += cell_width * text_scale;
+                }
+                renderCharScaled(@intCast(shortcut_digit), sc_x, text_y, sc_color, text_scale);
+            }
         }
 
         cursor_x += tab_w;
@@ -1287,6 +1332,13 @@ fn renderTitlebar(window_width: f32, window_height: f32, titlebar_h: f32) void {
             const t: f32 = 1.0;
             renderQuad(plus_cx - arm, plus_cy - t / 2, arm * 2, t, plus_icon_color);
             renderQuad(plus_cx - t / 2, plus_cy - arm, t, arm * 2, plus_icon_color);
+        }
+        // Sync plus button position for double-click suppression in WndProc
+        if (build_options.use_win32) {
+            if (g_window) |w| {
+                w.plus_btn_x_start = @intFromFloat(cursor_x);
+                w.plus_btn_x_end = @intFromFloat(cursor_x + plus_btn_w);
+            }
         }
         cursor_x += plus_btn_w;
     }

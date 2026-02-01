@@ -460,6 +460,9 @@ pub const Window = struct {
     pressed_button: CaptionButton = .none,
     /// Tab count (synced from main.zig each frame, used for hit-testing)
     tab_count: usize = 1,
+    /// Plus button x range (synced from renderer, used for double-click suppression)
+    plus_btn_x_start: i32 = 0,
+    plus_btn_x_end: i32 = 0,
     /// Current mouse position in client coordinates (for hover tracking)
     mouse_x: i32 = 0,
     mouse_y: i32 = 0,
@@ -1121,12 +1124,23 @@ fn wndProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.wina
                     }
                     return 0;
                 } else {
-                    // Multi-tab: only maximize in the gap between + button and caption buttons
-                    // The gap area is roughly from the end of tabs+plus to caption buttons
-                    // If clicked on caption button area or beyond, ignore
+                    // Multi-tab: allow maximize on tabs, but NOT on + button or caption area
                     if (x >= caption_x) return 0;
-                    // Let it pass through as a regular click for tab/+ button handling
-                    w.mouse_button_events.push(.{ .button = .left, .action = .press, .x = x, .y = y });
+                    // Check current + button position and where it was before
+                    // the first click created a tab (which shifted + to the right)
+                    if (x >= w.plus_btn_x_start and x < w.plus_btn_x_end) return 0;
+                    // Also check one tab-width to the left (where + was before new tab)
+                    if (w.tab_count > 2) {
+                        const tab_shift = @divTrunc(w.plus_btn_x_start, @as(i32, @intCast(w.tab_count)));
+                        const prev_start = w.plus_btn_x_start - tab_shift;
+                        if (x >= prev_start and x < w.plus_btn_x_end) return 0;
+                    }
+                    // On a tab — maximize/restore
+                    if (IsZoomed(hwnd) != 0) {
+                        _ = ShowWindow(hwnd, SW_RESTORE);
+                    } else {
+                        _ = ShowWindow(hwnd, SW_MAXIMIZE);
+                    }
                     return 0;
                 }
             }
