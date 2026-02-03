@@ -221,6 +221,7 @@ shell: []const u8 = "cmd",
 
 /// Show a debug FPS overlay in the bottom-right corner.
 @"phantty-debug-fps": bool = false,
+@"phantty-debug-draw-calls": bool = false,
 
 /// Load an additional config file. Can be repeated. Relative paths are
 /// resolved relative to the file containing the directive. Prefix with
@@ -436,6 +437,14 @@ fn applyKeyValue(self: *Config, allocator: std.mem.Allocator, key: []const u8, v
         } else {
             log.warn("invalid phantty-debug-fps: {s}", .{value});
         }
+    } else if (std.mem.eql(u8, key, "phantty-debug-draw-calls")) {
+        if (std.mem.eql(u8, value, "true")) {
+            self.@"phantty-debug-draw-calls" = true;
+        } else if (std.mem.eql(u8, value, "false")) {
+            self.@"phantty-debug-draw-calls" = false;
+        } else {
+            log.warn("invalid phantty-debug-draw-calls: {s}", .{value});
+        }
     } else if (std.mem.eql(u8, key, "config-file")) {
         self.loadConfigFileDirective(allocator, value, base_dir);
     } else {
@@ -614,6 +623,7 @@ pub fn printHelp() void {
         \\  --config-file <path>         Load additional config file (prefix ? for optional)
         \\
         \\  --phantty-debug-fps <bool>   Show FPS overlay (default: false)
+        \\  --phantty-debug-draw-calls <bool> Show draw call count overlay (default: false)
         \\
         \\  --show-config-path           Print the config file path and exit
         \\  --list-fonts                 List all available system fonts
@@ -759,6 +769,7 @@ const default_config_template =
     \\
     \\# Debug
     \\# phantty-debug-fps = false
+    \\# phantty-debug-draw-calls = false
     \\
     \\# Load additional config files
     \\# config-file = ?optional/extra-config

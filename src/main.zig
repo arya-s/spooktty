@@ -308,6 +308,123 @@ var g_titlebar_baseline: f32 = 3;
 var vao: c.GLuint = 0;
 var vbo: c.GLuint = 0;
 var shader_program: c.GLuint = 0;
+
+// ============================================================================
+// Instanced rendering — BG + FG cell buffers
+// ============================================================================
+
+/// Per-instance data for background cells (one per grid cell with non-default bg).
+const CellBg = extern struct {
+    grid_col: f32,
+    grid_row: f32,
+    r: f32,
+    g: f32,
+    b: f32,
+};
+
+/// Per-instance data for foreground cells (one per visible glyph).
+const CellFg = extern struct {
+    grid_col: f32,
+    grid_row: f32,
+    glyph_x: f32, // offset from cell left to glyph left
+    glyph_y: f32, // offset from cell bottom to glyph bottom
+    glyph_w: f32, // glyph width in pixels
+    glyph_h: f32, // glyph height in pixels
+    uv_left: f32,
+    uv_top: f32,
+    uv_right: f32,
+    uv_bottom: f32,
+    r: f32,
+    g: f32,
+    b: f32,
+};
+
+// Max cells = 300 cols x 100 rows = 30000 (generous)
+const MAX_CELLS = 30000;
+var bg_cells: [MAX_CELLS]CellBg = undefined;
+var fg_cells: [MAX_CELLS]CellFg = undefined;
+var bg_cell_count: usize = 0;
+var fg_cell_count: usize = 0;
+
+// GL objects for instanced rendering
+var bg_shader: c.GLuint = 0;
+var fg_shader: c.GLuint = 0;
+var bg_vao: c.GLuint = 0;
+var fg_vao: c.GLuint = 0;
+var bg_instance_vbo: c.GLuint = 0;
+var fg_instance_vbo: c.GLuint = 0;
+var quad_vbo: c.GLuint = 0; // shared unit quad for instanced draws
+
+// --- Instanced shader sources ---
+
+const bg_vertex_source: [*c]const u8 =
+    \\#version 330 core
+    \\// Unit quad (0,0)-(1,1)
+    \\layout (location = 0) in vec2 aQuad;
+    \\// Per-instance
+    \\layout (location = 1) in vec2 aGridPos;
+    \\layout (location = 2) in vec3 aColor;
+    \\uniform mat4 projection;
+    \\uniform vec2 cellSize;
+    \\uniform vec2 gridOffset;
+    \\uniform float windowHeight;
+    \\flat out vec3 vColor;
+    \\void main() {
+    \\    // Cell top-left in screen coords
+    \\    float cx = gridOffset.x + aGridPos.x * cellSize.x;
+    \\    float cy = windowHeight - gridOffset.y - (aGridPos.y + 1.0) * cellSize.y;
+    \\    vec2 pos = vec2(cx, cy) + aQuad * cellSize;
+    \\    gl_Position = projection * vec4(pos, 0.0, 1.0);
+    \\    vColor = aColor;
+    \\}
+;
+
+const bg_fragment_source: [*c]const u8 =
+    \\#version 330 core
+    \\flat in vec3 vColor;
+    \\out vec4 fragColor;
+    \\void main() {
+    \\    fragColor = vec4(vColor, 1.0);
+    \\}
+;
+
+const fg_vertex_source: [*c]const u8 =
+    \\#version 330 core
+    \\layout (location = 0) in vec2 aQuad;
+    \\// Per-instance
+    \\layout (location = 1) in vec2 aGridPos;
+    \\layout (location = 2) in vec4 aGlyphRect;  // x, y, w, h in pixels
+    \\layout (location = 3) in vec4 aUV;          // left, top, right, bottom
+    \\layout (location = 4) in vec3 aColor;
+    \\uniform mat4 projection;
+    \\uniform vec2 cellSize;
+    \\uniform vec2 gridOffset;
+    \\uniform float windowHeight;
+    \\out vec2 vTexCoord;
+    \\flat out vec3 vColor;
+    \\void main() {
+    \\    float cx = gridOffset.x + aGridPos.x * cellSize.x;
+    \\    float cy = windowHeight - gridOffset.y - (aGridPos.y + 1.0) * cellSize.y;
+    \\    // Glyph quad within cell
+    \\    vec2 pos = vec2(cx + aGlyphRect.x, cy + aGlyphRect.y) + aQuad * aGlyphRect.zw;
+    \\    gl_Position = projection * vec4(pos, 0.0, 1.0);
+    \\    // UV interpolation — V is flipped because atlas Y=0 is top but GL quad Y=0 is bottom
+    \\    vTexCoord = vec2(mix(aUV.x, aUV.z, aQuad.x), mix(aUV.w, aUV.y, aQuad.y));
+    \\    vColor = aColor;
+    \\}
+;
+
+const fg_fragment_source: [*c]const u8 =
+    \\#version 330 core
+    \\in vec2 vTexCoord;
+    \\flat in vec3 vColor;
+    \\uniform sampler2D atlas;
+    \\out vec4 fragColor;
+    \\void main() {
+    \\    float a = texture(atlas, vTexCoord).r;
+    \\    fragColor = vec4(vColor, 1.0) * vec4(1.0, 1.0, 1.0, a);
+    \\}
+;
 var cell_width: f32 = 10;
 var cell_height: f32 = 20;
 var cell_baseline: f32 = 4; // Distance from bottom of cell to baseline
@@ -353,6 +470,8 @@ const ConfigWatcher = @import("config_watcher.zig");
 
 // FPS debug overlay state
 var g_debug_fps: bool = false; // Whether to show FPS overlay
+var g_debug_draw_calls: bool = false; // Whether to show draw call count overlay
+var g_draw_call_count: u32 = 0; // Reset each frame, incremented on each glDraw* call
 var g_fps_frame_count: u32 = 0; // Frames since last FPS update
 var g_fps_last_time: i64 = 0; // Timestamp of last FPS calculation
 var g_fps_value: f32 = 0; // Current FPS value to display
@@ -454,6 +573,105 @@ fn initBuffers() void {
     gl.VertexAttribPointer.?(0, 4, c.GL_FLOAT, c.GL_FALSE, 4 * @sizeOf(f32), null);
     gl.BindBuffer.?(c.GL_ARRAY_BUFFER, 0);
     gl.BindVertexArray.?(0);
+}
+
+fn linkProgram(vs_src: [*c]const u8, fs_src: [*c]const u8) c.GLuint {
+    const vs = compileShader(c.GL_VERTEX_SHADER, vs_src) orelse return 0;
+    defer gl.DeleteShader.?(vs);
+    const fs = compileShader(c.GL_FRAGMENT_SHADER, fs_src) orelse return 0;
+    defer gl.DeleteShader.?(fs);
+    const prog = gl.CreateProgram.?();
+    gl.AttachShader.?(prog, vs);
+    gl.AttachShader.?(prog, fs);
+    gl.LinkProgram.?(prog);
+    var success: c.GLint = 0;
+    gl.GetProgramiv.?(prog, c.GL_LINK_STATUS, &success);
+    if (success == 0) {
+        var info_log: [512]u8 = @splat(0);
+        var log_len: c.GLsizei = 0;
+        gl.GetProgramInfoLog.?(prog, 512, &log_len, &info_log);
+        const len: usize = if (log_len > 0) @intCast(log_len) else 0;
+        if (len > 0) std.debug.print("Shader link failed: {s}\n", .{info_log[0..len]});
+        return 0;
+    }
+    return prog;
+}
+
+fn initInstancedBuffers() void {
+    // Shared unit quad (triangle strip: 4 verts)
+    const quad_verts = [4][2]f32{
+        .{ 0.0, 0.0 }, // bottom-left
+        .{ 1.0, 0.0 }, // bottom-right
+        .{ 0.0, 1.0 }, // top-left
+        .{ 1.0, 1.0 }, // top-right
+    };
+    gl.GenBuffers.?(1, &quad_vbo);
+    gl.BindBuffer.?(c.GL_ARRAY_BUFFER, quad_vbo);
+    gl.BufferData.?(c.GL_ARRAY_BUFFER, @sizeOf(@TypeOf(quad_verts)), &quad_verts, c.GL_STATIC_DRAW);
+
+    // --- BG VAO ---
+    gl.GenVertexArrays.?(1, &bg_vao);
+    gl.GenBuffers.?(1, &bg_instance_vbo);
+    gl.BindVertexArray.?(bg_vao);
+
+    // Attr 0: unit quad (per-vertex)
+    gl.BindBuffer.?(c.GL_ARRAY_BUFFER, quad_vbo);
+    gl.EnableVertexAttribArray.?(0);
+    gl.VertexAttribPointer.?(0, 2, c.GL_FLOAT, c.GL_FALSE, 2 * @sizeOf(f32), null);
+
+    // Attrs 1-2: per-instance BG data
+    gl.BindBuffer.?(c.GL_ARRAY_BUFFER, bg_instance_vbo);
+    gl.BufferData.?(c.GL_ARRAY_BUFFER, @sizeOf(CellBg) * MAX_CELLS, null, c.GL_STREAM_DRAW);
+    const bg_stride: c.GLsizei = @sizeOf(CellBg);
+    // Attr 1: grid_col, grid_row
+    gl.EnableVertexAttribArray.?(1);
+    gl.VertexAttribPointer.?(1, 2, c.GL_FLOAT, c.GL_FALSE, bg_stride, @ptrFromInt(0));
+    gl.VertexAttribDivisor.?(1, 1);
+    // Attr 2: r, g, b
+    gl.EnableVertexAttribArray.?(2);
+    gl.VertexAttribPointer.?(2, 3, c.GL_FLOAT, c.GL_FALSE, bg_stride, @ptrFromInt(2 * @sizeOf(f32)));
+    gl.VertexAttribDivisor.?(2, 1);
+
+    gl.BindVertexArray.?(0);
+
+    // --- FG VAO ---
+    gl.GenVertexArrays.?(1, &fg_vao);
+    gl.GenBuffers.?(1, &fg_instance_vbo);
+    gl.BindVertexArray.?(fg_vao);
+
+    // Attr 0: unit quad (per-vertex)
+    gl.BindBuffer.?(c.GL_ARRAY_BUFFER, quad_vbo);
+    gl.EnableVertexAttribArray.?(0);
+    gl.VertexAttribPointer.?(0, 2, c.GL_FLOAT, c.GL_FALSE, 2 * @sizeOf(f32), null);
+
+    // Attrs 1-4: per-instance FG data
+    gl.BindBuffer.?(c.GL_ARRAY_BUFFER, fg_instance_vbo);
+    gl.BufferData.?(c.GL_ARRAY_BUFFER, @sizeOf(CellFg) * MAX_CELLS, null, c.GL_STREAM_DRAW);
+    const fg_stride: c.GLsizei = @sizeOf(CellFg);
+    // Attr 1: grid_col, grid_row
+    gl.EnableVertexAttribArray.?(1);
+    gl.VertexAttribPointer.?(1, 2, c.GL_FLOAT, c.GL_FALSE, fg_stride, @ptrFromInt(0));
+    gl.VertexAttribDivisor.?(1, 1);
+    // Attr 2: glyph_x, glyph_y, glyph_w, glyph_h
+    gl.EnableVertexAttribArray.?(2);
+    gl.VertexAttribPointer.?(2, 4, c.GL_FLOAT, c.GL_FALSE, fg_stride, @ptrFromInt(2 * @sizeOf(f32)));
+    gl.VertexAttribDivisor.?(2, 1);
+    // Attr 3: uv_left, uv_top, uv_right, uv_bottom
+    gl.EnableVertexAttribArray.?(3);
+    gl.VertexAttribPointer.?(3, 4, c.GL_FLOAT, c.GL_FALSE, fg_stride, @ptrFromInt(6 * @sizeOf(f32)));
+    gl.VertexAttribDivisor.?(3, 1);
+    // Attr 4: r, g, b
+    gl.EnableVertexAttribArray.?(4);
+    gl.VertexAttribPointer.?(4, 3, c.GL_FLOAT, c.GL_FALSE, fg_stride, @ptrFromInt(10 * @sizeOf(f32)));
+    gl.VertexAttribDivisor.?(4, 1);
+
+    gl.BindVertexArray.?(0);
+
+    // --- Compile instanced shaders ---
+    bg_shader = linkProgram(bg_vertex_source, bg_fragment_source);
+    fg_shader = linkProgram(fg_vertex_source, fg_fragment_source);
+    if (bg_shader == 0) std.debug.print("BG instanced shader failed\n", .{});
+    if (fg_shader == 0) std.debug.print("FG instanced shader failed\n", .{});
 }
 
 /// Load a single glyph into the cache
@@ -1079,7 +1297,7 @@ fn renderTitlebarChar(codepoint: u32, x: f32, y: f32, color: [3]f32) void {
     gl.BindBuffer.?(c.GL_ARRAY_BUFFER, vbo);
     gl.BufferSubData.?(c.GL_ARRAY_BUFFER, 0, @sizeOf(@TypeOf(vertices)), &vertices);
     gl.BindBuffer.?(c.GL_ARRAY_BUFFER, 0);
-    gl.DrawArrays.?(c.GL_TRIANGLES, 0, 6);
+    gl.DrawArrays.?(c.GL_TRIANGLES, 0, 6); g_draw_call_count += 1;
 }
 
 /// Get the advance width of a titlebar glyph.
@@ -1116,7 +1334,7 @@ fn renderIconGlyph(ch: Character, btn_x: f32, btn_y: f32, btn_w: f32, btn_h: f32
     gl.BindBuffer.?(c.GL_ARRAY_BUFFER, vbo);
     gl.BufferSubData.?(c.GL_ARRAY_BUFFER, 0, @sizeOf(@TypeOf(vertices)), &vertices);
     gl.BindBuffer.?(c.GL_ARRAY_BUFFER, 0);
-    gl.DrawArrays.?(c.GL_TRIANGLES, 0, 6);
+    gl.DrawArrays.?(c.GL_TRIANGLES, 0, 6); g_draw_call_count += 1;
 }
 
 /// Compute UV coordinates from an atlas region and atlas size.
@@ -1162,7 +1380,7 @@ fn renderChar(codepoint: u32, x: f32, y: f32, color: [3]f32) void {
     gl.BindBuffer.?(c.GL_ARRAY_BUFFER, vbo);
     gl.BufferSubData.?(c.GL_ARRAY_BUFFER, 0, @sizeOf(@TypeOf(vertices)), &vertices);
     gl.BindBuffer.?(c.GL_ARRAY_BUFFER, 0);
-    gl.DrawArrays.?(c.GL_TRIANGLES, 0, 6);
+    gl.DrawArrays.?(c.GL_TRIANGLES, 0, 6); g_draw_call_count += 1;
 }
 
 
@@ -1640,62 +1858,44 @@ fn renderPlaceholderTab(window_width: f32, window_height: f32, top_pad: f32) voi
     }
 }
 
-fn renderTerminal(terminal: *ghostty_vt.Terminal, window_height: f32, offset_x: f32, offset_y: f32) void {
-    gl.UseProgram.?(shader_program);
-    gl.ActiveTexture.?(c.GL_TEXTURE0);
-    gl.BindVertexArray.?(vao);
-
+/// Build CPU cell buffers from terminal state.
+/// This iterates the grid once and fills bg_cells / fg_cells arrays.
+fn rebuildCells(terminal: *ghostty_vt.Terminal) void {
     const screen = terminal.screens.active;
-
-    // Get cursor position - only show cursor when viewport is at the bottom
     const cursor_x = screen.cursor.x;
     const cursor_y = screen.cursor.y;
     const viewport_at_bottom = screen.pages.viewport == .active;
 
-    // Get terminal-controlled cursor style (set by DECSCUSR escape sequence)
-    // This is what programs like vim use to change cursor shape
     const terminal_cursor_style: TerminalCursorStyle = switch (screen.cursor.cursor_style) {
         .bar => .bar,
         .block => .block,
         .underline => .underline,
         .block_hollow => .block_hollow,
     };
-
-    // Get terminal-controlled cursor blink mode (also set by DECSCUSR)
-    // Steady styles (2, 4, 6) set this to false, blinking styles (1, 3, 5) set it to true
     const terminal_cursor_blink = terminal.modes.get(.cursor_blinking);
 
-    // Use terminal's actual dimensions for rendering (not global vars which may be out of sync)
     const render_rows = terminal.rows;
     const render_cols = terminal.cols;
+    const atlas_size = if (g_atlas) |a| @as(f32, @floatFromInt(a.size)) else 512.0;
+
+    bg_cell_count = 0;
+    fg_cell_count = 0;
 
     for (0..render_rows) |row_idx| {
-        // Row 0 is at the top, so we start from (window_height - offset) and go down
-        const y = window_height - offset_y - ((@as(f32, @floatFromInt(row_idx)) + 1) * cell_height);
-
         for (0..render_cols) |col_idx| {
-            const x = offset_x + @as(f32, @floatFromInt(col_idx)) * cell_width;
-
-            // Check if this is the cursor position (only when viewport is at bottom)
             const is_cursor = viewport_at_bottom and (col_idx == cursor_x and row_idx == cursor_y);
 
-            // Get cell from the page list
             const cell_data = screen.pages.getCell(.{ .viewport = .{
                 .x = @intCast(col_idx),
                 .y = @intCast(row_idx),
             } });
-            
 
-
-            // Get foreground color from cell style
-            var fg_color: [3]f32 = g_theme.foreground; // Default from theme
+            var fg_color: [3]f32 = g_theme.foreground;
             var bg_color: ?[3]f32 = null;
 
             if (cell_data) |cd| {
                 const cell = cd.cell;
 
-                // Check for background-only cells (used by erase operations like \e[K)
-                // These cells have no text but store a background color directly
                 switch (cell.content_tag) {
                     .bg_color_palette => {
                         bg_color = indexToRgb(cell.content.color_palette);
@@ -1711,13 +1911,11 @@ fn renderTerminal(terminal: *ghostty_vt.Terminal, window_height: f32, offset_x: 
                     else => {},
                 }
 
-                // Get style if available (for text cells with styling)
                 if (cell.hasStyling()) {
                     const style = cd.node.data.styles.get(
                         cd.node.data.memory,
                         cell.style_id,
                     );
-                    // Foreground color
                     switch (style.fg_color) {
                         .none => {},
                         .palette => |idx| fg_color = indexToRgb(idx),
@@ -1727,7 +1925,6 @@ fn renderTerminal(terminal: *ghostty_vt.Terminal, window_height: f32, offset_x: 
                             @as(f32, @floatFromInt(rgb.b)) / 255.0,
                         },
                     }
-                    // Background color from style (overrides bg-only cell color)
                     switch (style.bg_color) {
                         .none => {},
                         .palette => |idx| bg_color = indexToRgb(idx),
@@ -1740,28 +1937,177 @@ fn renderTerminal(terminal: *ghostty_vt.Terminal, window_height: f32, offset_x: 
                 }
             }
 
-            // Check if cell is selected
+            // Selection / cursor background
             const is_selected = isCellSelected(col_idx, row_idx);
+            const col_f: f32 = @floatFromInt(col_idx);
+            const row_f: f32 = @floatFromInt(row_idx);
 
-            // Draw cursor (with style and blink support like Ghostty)
             if (is_cursor) {
-                const cursor_result = renderCursor(x, y, cell_width, cell_height, terminal_cursor_style, terminal_cursor_blink);
-                if (cursor_result.invert_fg) {
-                    // Use cursor_text if defined, otherwise use background color (inverted)
-                    fg_color = g_theme.cursor_text orelse g_theme.background;
+                // Cursor gets added as BG cells for block, handled separately for bar/underline/hollow
+                if (cursorEffectiveStyle(terminal_cursor_style, terminal_cursor_blink)) |effective_style| {
+                    switch (effective_style) {
+                        .block => {
+                            if (bg_cell_count < MAX_CELLS) {
+                                bg_cells[bg_cell_count] = .{ .grid_col = col_f, .grid_row = row_f, .r = g_theme.cursor_color[0], .g = g_theme.cursor_color[1], .b = g_theme.cursor_color[2] };
+                                bg_cell_count += 1;
+                            }
+                            fg_color = g_theme.cursor_text orelse g_theme.background;
+                        },
+                        else => {
+                            // Bar, underline, hollow — draw normal bg, cursor drawn as overlay after
+                            if (bg_color) |bg| {
+                                if (bg_cell_count < MAX_CELLS) {
+                                    bg_cells[bg_cell_count] = .{ .grid_col = col_f, .grid_row = row_f, .r = bg[0], .g = bg[1], .b = bg[2] };
+                                    bg_cell_count += 1;
+                                }
+                            }
+                        },
+                    }
                 }
             } else if (is_selected) {
-                renderQuad(x, y, cell_width, cell_height, g_theme.selection_background);
+                if (bg_cell_count < MAX_CELLS) {
+                    bg_cells[bg_cell_count] = .{ .grid_col = col_f, .grid_row = row_f, .r = g_theme.selection_background[0], .g = g_theme.selection_background[1], .b = g_theme.selection_background[2] };
+                    bg_cell_count += 1;
+                }
                 fg_color = g_theme.selection_foreground orelse g_theme.foreground;
             } else if (bg_color) |bg| {
-                renderQuad(x, y, cell_width, cell_height, bg);
+                if (bg_cell_count < MAX_CELLS) {
+                    bg_cells[bg_cell_count] = .{ .grid_col = col_f, .grid_row = row_f, .r = bg[0], .g = bg[1], .b = bg[2] };
+                    bg_cell_count += 1;
+                }
             }
 
-            // Render character if present
+            // Foreground glyph
             if (cell_data) |cd| {
                 const char = cd.cell.codepoint();
                 if (char != 0 and char != ' ') {
-                    renderChar(char, x, y, fg_color);
+                    if (loadGlyph(char)) |ch| {
+                        if (ch.region.width > 0 and ch.region.height > 0) {
+                            const uv = glyphUV(ch.region, atlas_size);
+                            const gx = @as(f32, @floatFromInt(ch.bearing_x));
+                            const gy = cell_baseline - @as(f32, @floatFromInt(@as(i32, @intCast(ch.size_y)) - ch.bearing_y));
+                            const gw = @as(f32, @floatFromInt(ch.size_x));
+                            const gh = @as(f32, @floatFromInt(ch.size_y));
+                            if (fg_cell_count < MAX_CELLS) {
+                                fg_cells[fg_cell_count] = .{
+                                    .grid_col = col_f,
+                                    .grid_row = row_f,
+                                    .glyph_x = gx,
+                                    .glyph_y = gy,
+                                    .glyph_w = gw,
+                                    .glyph_h = gh,
+                                    .uv_left = uv.u0,
+                                    .uv_top = uv.v0,
+                                    .uv_right = uv.u1,
+                                    .uv_bottom = uv.v1,
+                                    .r = fg_color[0],
+                                    .g = fg_color[1],
+                                    .b = fg_color[2],
+                                };
+                                fg_cell_count += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Determine effective cursor style (factoring in blink and focus).
+/// Returns null during blink-off phase (cursor hidden).
+fn cursorEffectiveStyle(terminal_style: TerminalCursorStyle, terminal_blink: bool) ?CursorStyle {
+    if (!window_focused) return .block_hollow;
+    const should_blink = terminal_blink and g_cursor_blink;
+    if (should_blink and !g_cursor_blink_visible) return null;
+    return switch (terminal_style) {
+        .block => .block,
+        .bar => .bar,
+        .underline => .underline,
+        .block_hollow => .block_hollow,
+    };
+}
+
+/// Render the terminal grid using instanced draw calls.
+/// 1. rebuildCells fills CPU buffers
+/// 2. Upload + draw BG instances
+/// 3. Upload + draw FG instances
+/// 4. Draw cursor overlay (bar/underline/hollow) using old renderQuad path
+fn renderTerminal(terminal: *ghostty_vt.Terminal, window_height: f32, offset_x: f32, offset_y: f32) void {
+    rebuildCells(terminal);
+
+    // --- Draw BG cells ---
+    if (bg_cell_count > 0 and bg_shader != 0) {
+        gl.UseProgram.?(bg_shader);
+        gl.Uniform2f.?(gl.GetUniformLocation.?(bg_shader, "cellSize"), cell_width, cell_height);
+        gl.Uniform2f.?(gl.GetUniformLocation.?(bg_shader, "gridOffset"), offset_x, offset_y);
+        gl.Uniform1f.?(gl.GetUniformLocation.?(bg_shader, "windowHeight"), window_height);
+        setProjectionForProgram(bg_shader, window_height);
+
+        gl.BindVertexArray.?(bg_vao);
+        gl.BindBuffer.?(c.GL_ARRAY_BUFFER, bg_instance_vbo);
+        gl.BufferSubData.?(c.GL_ARRAY_BUFFER, 0, @intCast(@sizeOf(CellBg) * bg_cell_count), &bg_cells);
+        gl.DrawArraysInstanced.?(c.GL_TRIANGLE_STRIP, 0, 4, @intCast(bg_cell_count)); g_draw_call_count += 1;
+    }
+
+    // --- Draw FG cells ---
+    if (fg_cell_count > 0 and fg_shader != 0) {
+        gl.UseProgram.?(fg_shader);
+        gl.Uniform2f.?(gl.GetUniformLocation.?(fg_shader, "cellSize"), cell_width, cell_height);
+        gl.Uniform2f.?(gl.GetUniformLocation.?(fg_shader, "gridOffset"), offset_x, offset_y);
+        gl.Uniform1f.?(gl.GetUniformLocation.?(fg_shader, "windowHeight"), window_height);
+        setProjectionForProgram(fg_shader, window_height);
+
+        gl.ActiveTexture.?(c.GL_TEXTURE0);
+        gl.BindTexture.?(c.GL_TEXTURE_2D, g_atlas_texture);
+        gl.Uniform1i.?(gl.GetUniformLocation.?(fg_shader, "atlas"), 0);
+
+        gl.BindVertexArray.?(fg_vao);
+        gl.BindBuffer.?(c.GL_ARRAY_BUFFER, fg_instance_vbo);
+        gl.BufferSubData.?(c.GL_ARRAY_BUFFER, 0, @intCast(@sizeOf(CellFg) * fg_cell_count), &fg_cells);
+        gl.DrawArraysInstanced.?(c.GL_TRIANGLE_STRIP, 0, 4, @intCast(fg_cell_count)); g_draw_call_count += 1;
+    }
+
+    // --- Cursor overlay (bar, underline, hollow box) ---
+    // Block cursor is already in BG cells; bar/underline/hollow need separate quads
+    {
+        const screen = terminal.screens.active;
+        const viewport_at_bottom = screen.pages.viewport == .active;
+        if (viewport_at_bottom) {
+            const cx = screen.cursor.x;
+            const cy = screen.cursor.y;
+            const terminal_cursor_style: TerminalCursorStyle = switch (screen.cursor.cursor_style) {
+                .bar => .bar,
+                .block => .block,
+                .underline => .underline,
+                .block_hollow => .block_hollow,
+            };
+            const terminal_cursor_blink = terminal.modes.get(.cursor_blinking);
+            if (cursorEffectiveStyle(terminal_cursor_style, terminal_cursor_blink)) |effective| {
+                const px = offset_x + @as(f32, @floatFromInt(cx)) * cell_width;
+                const py = window_height - offset_y - ((@as(f32, @floatFromInt(cy)) + 1) * cell_height);
+
+                // Switch to the old per-glyph shader for cursor overlay quads
+                gl.UseProgram.?(shader_program);
+                gl.BindVertexArray.?(vao);
+
+                const cursor_color = g_theme.cursor_color;
+                const cursor_thickness: f32 = 1.0;
+
+                switch (effective) {
+                    .bar => renderQuad(px, py, cursor_thickness, cell_height, cursor_color),
+                    .underline => renderQuad(px, py, cell_width, cursor_thickness, cursor_color),
+                    .block_hollow => {
+                        renderQuad(px, py, cell_width, cell_height, cursor_color);
+                        renderQuad(
+                            px + cursor_thickness,
+                            py + cursor_thickness,
+                            cell_width - cursor_thickness * 2,
+                            cell_height - cursor_thickness * 2,
+                            g_theme.background,
+                        );
+                    },
+                    .block => {},
                 }
             }
         }
@@ -1992,7 +2338,7 @@ fn renderPostProcess(width: c_int, height: c_int) void {
 
     // Draw fullscreen quad
     gl.BindVertexArray.?(g_post_vao);
-    gl.DrawArrays.?(c.GL_TRIANGLES, 0, 6);
+    gl.DrawArrays.?(c.GL_TRIANGLES, 0, 6); g_draw_call_count += 1;
     gl.BindVertexArray.?(0);
 
     // Re-enable blending for next terminal render pass
@@ -2033,79 +2379,12 @@ fn renderQuad(x: f32, y: f32, w: f32, h: f32, color: [3]f32) void {
     gl.BindBuffer.?(c.GL_ARRAY_BUFFER, vbo);
     gl.BufferSubData.?(c.GL_ARRAY_BUFFER, 0, @sizeOf(@TypeOf(vertices)), &vertices);
     gl.BindBuffer.?(c.GL_ARRAY_BUFFER, 0);
-    gl.DrawArrays.?(c.GL_TRIANGLES, 0, 6);
+    gl.DrawArrays.?(c.GL_TRIANGLES, 0, 6); g_draw_call_count += 1;
 }
 
 // Terminal cursor style defined in renderer/cursor.zig
 const TerminalCursorStyle = renderer.cursor.TerminalCursorStyle;
 
-/// Render the cursor with style and blink support (like Ghostty)
-/// Returns whether foreground should be inverted (for block cursor)
-/// terminal_style is the style requested by the terminal (via DECSCUSR escape sequence)
-/// terminal_blink is the blink mode from the terminal (set by DECSCUSR steady/blinking variants)
-fn renderCursor(x: f32, y: f32, w: f32, h: f32, terminal_style: TerminalCursorStyle, terminal_blink: bool) struct { invert_fg: bool } {
-    const cursor_color = g_theme.cursor_color;
-    // Cursor thickness defaults to 1 pixel like Ghostty (metrics.cursor_thickness = 1)
-    const cursor_thickness: f32 = 1.0;
-
-    // Determine effective cursor style (like Ghostty's cursor.zig logic)
-    // Priority: unfocused -> blink off -> terminal-controlled style -> configured style
-    const effective_style: CursorStyle = blk: {
-        // If not focused, always show hollow block
-        if (!window_focused) break :blk .block_hollow;
-
-        // Check if cursor should blink:
-        // - terminal_blink: controlled by DECSCUSR (steady vs blinking variants)
-        // - g_cursor_blink: user's --cursor-style-blink setting
-        // Cursor blinks if BOTH are true (terminal wants blink AND user hasn't disabled it)
-        const should_blink = terminal_blink and g_cursor_blink;
-        if (should_blink and !g_cursor_blink_visible) {
-            return .{ .invert_fg = false }; // Don't render cursor (blink off phase)
-        }
-
-        // Use terminal-controlled style (from DECSCUSR escape sequence)
-        // This allows programs like vim to change cursor shape
-        break :blk switch (terminal_style) {
-            .block => .block,
-            .bar => .bar,
-            .underline => .underline,
-            .block_hollow => .block_hollow,
-        };
-    };
-
-    switch (effective_style) {
-        .block => {
-            // Solid filled block
-            renderQuad(x, y, w, h, cursor_color);
-            return .{ .invert_fg = true };
-        },
-        .block_hollow => {
-            // Hollow rectangle - fill then hollow out the inside (like Ghostty)
-            // Draw outer rect
-            renderQuad(x, y, w, h, cursor_color);
-            // Hollow out inside with background color from theme
-            renderQuad(
-                x + cursor_thickness,
-                y + cursor_thickness,
-                w - cursor_thickness * 2,
-                h - cursor_thickness * 2,
-                g_theme.background,
-            );
-            return .{ .invert_fg = false };
-        },
-        .bar => {
-            // Vertical bar on left side of cell
-            // Ghostty places bar cursor half thickness over left edge for centering
-            renderQuad(x, y, cursor_thickness, h, cursor_color);
-            return .{ .invert_fg = false };
-        },
-        .underline => {
-            // Horizontal line at bottom of cell
-            renderQuad(x, y, w, cursor_thickness, cursor_color);
-            return .{ .invert_fg = false };
-        },
-    }
-}
 
 /// Update the FPS counter. Call once per frame.
 fn updateFps() void {
@@ -2120,45 +2399,55 @@ fn updateFps() void {
 }
 
 /// Render the FPS debug overlay in the bottom-right corner.
-fn renderFpsOverlay(window_width: f32) void {
-    if (!g_debug_fps) return;
+fn renderDebugOverlay(window_width: f32) void {
+    const margin: f32 = 8;
+    const pad_h: f32 = 4;
+    const pad_v: f32 = 2;
+    const line_h = g_titlebar_cell_height + pad_v * 2;
+    var overlay_y: f32 = margin;
+
+    if (g_debug_fps) {
+        renderDebugLine(window_width, &overlay_y, margin, pad_h, pad_v, line_h, blk: {
+            var buf: [32]u8 = undefined;
+            const fps_int: u32 = @intFromFloat(@round(g_fps_value));
+            break :blk std.fmt.bufPrint(&buf, "{d} fps", .{fps_int}) catch break :blk "";
+        }, .{ 0.0, 1.0, 0.0 });
+    }
+
+    if (g_debug_draw_calls) {
+        renderDebugLine(window_width, &overlay_y, margin, pad_h, pad_v, line_h, blk: {
+            var buf: [32]u8 = undefined;
+            break :blk std.fmt.bufPrint(&buf, "{d} draws", .{g_draw_call_count}) catch break :blk "";
+        }, .{ 1.0, 1.0, 0.0 });
+    }
+}
+
+fn renderDebugLine(window_width: f32, y_pos: *f32, margin: f32, pad_h: f32, pad_v: f32, line_h: f32, text: []const u8, text_color: [3]f32) void {
+    if (text.len == 0) return;
 
     gl.UseProgram.?(shader_program);
     gl.ActiveTexture.?(c.GL_TEXTURE0);
     gl.BindVertexArray.?(vao);
 
-    // Format FPS string: "XXX fps"
-    var buf: [32]u8 = undefined;
-    const fps_int: u32 = @intFromFloat(@round(g_fps_value));
-    const text = std.fmt.bufPrint(&buf, "{d} fps", .{fps_int}) catch return;
-
-    // Measure text width using titlebar font
     var text_width: f32 = 0;
     for (text) |ch| {
         text_width += titlebarGlyphAdvance(@intCast(ch));
     }
 
-    // Position: bottom-right with some padding
-    const margin: f32 = 8;
-    const pad_h: f32 = 4;
-    const pad_v: f32 = 2;
     const bg_w = text_width + pad_h * 2;
-    const bg_h = g_titlebar_cell_height + pad_v * 2;
     const bg_x = window_width - bg_w - margin;
-    const bg_y = margin;
+    const bg_y = y_pos.*;
 
-    // Semi-transparent dark background
-    const bg_color = [3]f32{ 0.0, 0.0, 0.0 };
-    renderQuad(bg_x, bg_y, bg_w, bg_h, bg_color);
+    renderQuad(bg_x, bg_y, bg_w, line_h, .{ 0.0, 0.0, 0.0 });
 
-    // Draw text using titlebar font (native size, no scaling)
-    const text_color = [3]f32{ 0.0, 1.0, 0.0 }; // Bright green
     var x = bg_x + pad_h;
     const y = bg_y + pad_v;
     for (text) |ch| {
         renderTitlebarChar(@intCast(ch), x, y, text_color);
         x += titlebarGlyphAdvance(@intCast(ch));
     }
+
+    y_pos.* += line_h + 2; // spacing between lines
 }
 
 /// Update cursor blink state based on time (call once per frame)
@@ -2273,6 +2562,7 @@ fn checkConfigReload(allocator: std.mem.Allocator, watcher: *ConfigWatcher) void
     g_cursor_style = cfg.@"cursor-style";
     g_cursor_blink = cfg.@"cursor-style-blink";
     g_debug_fps = cfg.@"phantty-debug-fps";
+    g_debug_draw_calls = cfg.@"phantty-debug-draw-calls";
 
     // Sync cursor style to all tabs' terminals (rendering reads from terminal state)
     for (0..g_tab_count) |ti| {
@@ -3238,6 +3528,24 @@ fn setProjection(width: f32, height: f32) void {
     gl.UniformMatrix4fv.?(gl.GetUniformLocation.?(shader_program, "projection"), 1, c.GL_FALSE, &projection);
 }
 
+/// Set the orthographic projection matrix on a specific shader program.
+fn setProjectionForProgram(program: c.GLuint, window_height: f32) void {
+    var viewport: [4]c.GLint = undefined;
+    gl.GetIntegerv.?(c.GL_VIEWPORT, &viewport);
+    const width: f32 = @floatFromInt(viewport[2]);
+    const height: f32 = @floatFromInt(viewport[3]);
+    _ = window_height;
+
+    const projection = [16]f32{
+        2.0 / width, 0.0,          0.0,  0.0,
+        0.0,         2.0 / height, 0.0,  0.0,
+        0.0,         0.0,          -1.0, 0.0,
+        -1.0,        -1.0,         0.0,  1.0,
+    };
+
+    gl.UniformMatrix4fv.?(gl.GetUniformLocation.?(program, "projection"), 1, c.GL_FALSE, &projection);
+}
+
 pub fn main() !void {
     std.debug.print("Phantty starting...\n", .{});
 
@@ -3276,6 +3584,7 @@ pub fn main() !void {
     g_cursor_style = cfg.@"cursor-style";
     g_cursor_blink = cfg.@"cursor-style-blink";
     g_debug_fps = cfg.@"phantty-debug-fps";
+    g_debug_draw_calls = cfg.@"phantty-debug-draw-calls";
     // Apply window size from config (0 = auto, use defaults)
     if (cfg.@"window-width" > 0) term_cols = cfg.@"window-width";
     if (cfg.@"window-height" > 0) term_rows = cfg.@"window-height";
@@ -3488,6 +3797,7 @@ pub fn main() !void {
         return error.ShaderInitFailed;
     }
     initBuffers();
+    initInstancedBuffers();
     preloadCharacters(face);
 
     // Initialize titlebar font — same family at fixed 14pt for crisp tab titles
@@ -3595,6 +3905,14 @@ pub fn main() !void {
                 gl.DeleteTextures.?(1, &g_post_texture);
             }
         }
+        // Clean up instanced rendering resources
+        if (bg_shader != 0) gl.DeleteProgram.?(bg_shader);
+        if (fg_shader != 0) gl.DeleteProgram.?(fg_shader);
+        if (bg_vao != 0) gl.DeleteVertexArrays.?(1, &bg_vao);
+        if (fg_vao != 0) gl.DeleteVertexArrays.?(1, &fg_vao);
+        if (bg_instance_vbo != 0) gl.DeleteBuffers.?(1, &bg_instance_vbo);
+        if (fg_instance_vbo != 0) gl.DeleteBuffers.?(1, &fg_instance_vbo);
+        if (quad_vbo != 0) gl.DeleteBuffers.?(1, &quad_vbo);
     }
 
     // Calculate window size based on cell dimensions (small padding for aesthetics)
@@ -3699,6 +4017,7 @@ pub fn main() !void {
             const fb_width: c_int = fb.width;
             const fb_height: c_int = fb.height;
 
+            g_draw_call_count = 0;
             updateFps();
 
             // Sync atlas textures to GPU if modified
@@ -3730,7 +4049,7 @@ pub fn main() !void {
                 }
             }
 
-            renderFpsOverlay(@floatFromInt(fb_width));
+            renderDebugOverlay(@floatFromInt(fb_width));
 
             win.swapBuffers();
         } else {
@@ -3738,6 +4057,7 @@ pub fn main() !void {
             var fb_height: c_int = 0;
             c.glfwGetFramebufferSize(glfw_window, &fb_width, &fb_height);
 
+            g_draw_call_count = 0;
             updateFps();
 
             // Sync atlas textures to GPU if modified
@@ -3764,7 +4084,7 @@ pub fn main() !void {
                 }
             }
 
-            renderFpsOverlay(@floatFromInt(fb_width));
+            renderDebugOverlay(@floatFromInt(fb_width));
 
             c.glfwSwapBuffers(glfw_window);
             c.glfwPollEvents();
