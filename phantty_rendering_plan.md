@@ -73,6 +73,11 @@ splits will hold multiple later.
 Each phase ends with a **build + run check**. We do NOT proceed to the
 next phase until the current one compiles and runs correctly.
 
+After each phase builds successfully, the LLM must present **2–3 manual
+test cases** to the user so they can verify the phase works as intended
+before moving on. Test cases should be concrete actions the user can
+perform in the running terminal, with expected observable outcomes.
+
 ---
 
 ### Phase 1: Module Extraction + Surface Abstraction
@@ -124,6 +129,11 @@ next phase until the current one compiles and runs correctly.
 
 **Verification**: `zig build -Duse_win32=true && zig-out\bin\phantty.exe` -- everything works exactly as before. This is a pure refactor with no behavior changes.
 
+**Manual test cases** (tell the user these after the phase builds):
+1. **Basic operation**: Open phantty, type a command (`dir` or `ls`), see output. Open a second tab with Ctrl+Shift+T, switch between them. Close a tab with Ctrl+W. This confirms the Surface abstraction didn't break tab lifecycle.
+2. **Tab titles**: Run a command that changes the working directory (`cd ..`). Verify the tab title updates in the titlebar. This confirms OSC title scanning still works after moving to Surface.zig.
+3. **Config hot-reload**: Press Ctrl+, to open the config, change the theme or font-size, save. Verify it applies live. This confirms the config reload path works through the new module boundaries.
+
 ---
 
 ### Phase 2: IO Thread -- Decouple PTY Reading
@@ -146,6 +156,11 @@ next phase until the current one compiles and runs correctly.
 5. Background tabs: IO threads keep running (draining PTY data even when not visible)
 
 **Verification**: Build and run. Multiple tabs work. High-throughput output doesn't freeze UI. Tab switching is instant.
+
+**Manual test cases** (tell the user these after the phase builds):
+1. **High-throughput flood**: Open two tabs. In tab 1, run a flood command (PowerShell: `1..100000 | ForEach-Object { $_ }`; WSL: `yes | head -100000`). While it's running, Ctrl+Tab to tab 2. Verify you can type immediately — the UI should not freeze. Switch back to tab 1; output should have continued accumulating.
+2. **Background tab draining**: In tab 1, start `ping -t localhost`. Switch to tab 2, wait 5 seconds, switch back. Verify output kept accumulating while you were away — no burst of catch-up, no stalled output.
+3. **Clean shutdown under load**: Run a long-running command (`ping -t localhost`), then close the tab with Ctrl+W or close the window entirely. Verify it shuts down promptly with no hang — the IO thread should unblock and join cleanly.
 
 ---
 
@@ -197,6 +212,11 @@ Two atlases: grayscale (text) and BGRA (color emoji, later).
 
 **Verification**: Build and run. ASCII text looks correct. Colors work. No visual regressions. Confirm single atlas texture with `glGetIntegerv(GL_TEXTURE_BINDING_2D)`.
 
+**Manual test cases** (tell the user these after the phase builds):
+1. **Visual correctness**: Open phantty, run a command with colored output (PowerShell: `Get-ChildItem`; WSL: `ls --color`). Verify text renders identically to before — same glyph shapes, same colors, same spacing. No garbled characters, no missing glyphs, no offset issues. This confirms the atlas UV mapping is correct.
+2. **Box drawing / special characters**: Run a TUI app that uses box drawing characters (e.g. `htop`, `btop`, or a `tree` command in WSL). Verify box-drawing lines connect properly and powerline/braille symbols render. This confirms sprite glyphs pack into the atlas correctly.
+3. **Font hot-reload**: Press Ctrl+, and change `font-family` or `font-size` in the config, save. Verify the terminal re-renders with the new font. This confirms the atlas is cleared and rebuilt correctly on config reload.
+
 ---
 
 ### Phase 4: Batched Draw Calls
@@ -229,6 +249,11 @@ Two atlases: grayscale (text) and BGRA (color emoji, later).
 
 **Verification**: Build and run. Rendering identical. Test colors, cursor, selection. Check FPS improvement.
 
+**Manual test cases** (tell the user these after the phase builds):
+1. **FPS improvement**: Enable the FPS overlay (`phantty-debug-fps = true` in config). Open a terminal with a full screen of text (run `dir /s` or `find /`). Compare the FPS counter to the value before this phase — it should be noticeably higher since we went from O(rows×cols) draw calls to 2.
+2. **Cursor and selection**: Click and drag to select text, verify the selection highlight renders. Verify cursor blink works in all styles (block, bar, underline — change via `cursor-style` in config). This confirms cursor/selection are integrated into the batched cell buffers.
+3. **Colored output + backgrounds**: Run something with ANSI background colors (e.g. `git diff` with colored output, or a colorful prompt). Verify both foreground text colors and background cell colors render correctly. This confirms the BG and FG cell buffers are both working.
+
 ---
 
 ### Phase 5: Dirty Row Tracking
@@ -248,6 +273,11 @@ Two atlases: grayscale (text) and BGRA (color emoji, later).
 4. Static terminal = zero per-frame CPU work
 
 **Verification**: Build and run. Static terminal has minimal CPU. Interactive typing updates only affected rows. High-throughput maintains FPS.
+
+**Manual test cases** (tell the user these after the phase builds):
+1. **Idle CPU usage**: Open phantty, don't type anything, just leave it sitting at a prompt. Check CPU usage in Task Manager — it should be near zero (no per-frame cell rebuilds when nothing changed). Compare to the previous phase where it rebuilt every frame.
+2. **Typing latency**: Type a long command character by character. Only the row with the cursor should be rebuilt each keypress. Verify the FPS overlay stays high and typing feels snappy — no full-grid rebuilds on each keystroke.
+3. **Scroll vs full rebuild**: Run a command that produces many lines of output (`dir /s` or `find /`). Verify scrollback scrolling (Shift+PageUp/Down) is smooth. Then resize the window — this should trigger a full rebuild. Verify resize still works correctly and the terminal reflows properly.
 
 ---
 

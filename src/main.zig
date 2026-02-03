@@ -266,8 +266,11 @@ const DEFAULT_FONT_SIZE: u32 = 14;
 // OpenGL context from glad
 var gl: c.GladGLContext = undefined;
 
+const FontAtlas = @import("font/Atlas.zig");
+
 const Character = struct {
-    texture_id: c.GLuint,
+    // Atlas region (UV coordinates derived from this + atlas size)
+    region: FontAtlas.Region,
     size_x: i32,
     size_y: i32,
     bearing_x: i32,
@@ -281,6 +284,16 @@ var glyph_cache: std.AutoHashMapUnmanaged(u32, Character) = .empty;
 var glyph_face: ?freetype.Face = null;
 var icon_face: ?freetype.Face = null; // Segoe MDL2 Assets for caption button icons
 var icon_cache: std.AutoHashMapUnmanaged(u32, Character) = .empty;
+
+// Font atlas — single texture for all glyphs (replaces per-glyph textures)
+var g_atlas: ?FontAtlas = null;
+var g_atlas_texture: c.GLuint = 0;
+var g_atlas_modified: usize = 0; // Last synced modified counter
+
+// Icon atlas — separate atlas for caption button icons (Segoe MDL2)
+var g_icon_atlas: ?FontAtlas = null;
+var g_icon_atlas_texture: c.GLuint = 0;
+var g_icon_atlas_modified: usize = 0;
 var vao: c.GLuint = 0;
 var vbo: c.GLuint = 0;
 var shader_program: c.GLuint = 0;
@@ -474,27 +487,18 @@ fn loadGlyph(codepoint: u32) ?Character {
     const glyph = face_to_use.handle.*.glyph;
     const bitmap = glyph.*.bitmap;
 
-    var texture: c.GLuint = 0;
-    gl.GenTextures.?(1, &texture);
-    gl.BindTexture.?(c.GL_TEXTURE_2D, texture);
-    gl.TexImage2D.?(
-        c.GL_TEXTURE_2D,
-        0,
-        c.GL_RED,
-        @intCast(bitmap.width),
-        @intCast(bitmap.rows),
-        0,
-        c.GL_RED,
-        c.GL_UNSIGNED_BYTE,
+    // Pack glyph bitmap into the font atlas
+    const region = packBitmapIntoAtlas(
+        &g_atlas,
+        alloc,
+        bitmap.width,
+        bitmap.rows,
         bitmap.buffer,
-    );
-    gl.TexParameteri.?(c.GL_TEXTURE_2D, c.GL_TEXTURE_WRAP_S, c.GL_CLAMP_TO_EDGE);
-    gl.TexParameteri.?(c.GL_TEXTURE_2D, c.GL_TEXTURE_WRAP_T, c.GL_CLAMP_TO_EDGE);
-    gl.TexParameteri.?(c.GL_TEXTURE_2D, c.GL_TEXTURE_MIN_FILTER, c.GL_LINEAR);
-    gl.TexParameteri.?(c.GL_TEXTURE_2D, c.GL_TEXTURE_MAG_FILTER, c.GL_LINEAR);
+        @intCast(bitmap.pitch),
+    ) orelse return null;
 
     const char_data = Character{
-        .texture_id = texture,
+        .region = region,
         .size_x = @intCast(bitmap.width),
         .size_y = @intCast(bitmap.rows),
         .bearing_x = glyph.*.bitmap_left,
@@ -507,6 +511,95 @@ fn loadGlyph(codepoint: u32) ?Character {
     glyph_cache.put(alloc, codepoint, char_data) catch return null;
 
     return char_data;
+}
+
+/// Pack a bitmap into an atlas (growing if necessary), returning the region.
+/// `src_buffer` may be null for zero-size bitmaps (returns a zero-size region).
+/// `src_pitch` is the stride of the source bitmap in bytes (may differ from width).
+fn packBitmapIntoAtlas(
+    atlas_ptr: *?FontAtlas,
+    alloc: std.mem.Allocator,
+    width: u32,
+    height: u32,
+    src_buffer: ?[*]const u8,
+    src_pitch: u32,
+) ?FontAtlas.Region {
+    // Zero-size glyph (e.g., space) — return a trivial region
+    if (width == 0 or height == 0) {
+        return .{ .x = 0, .y = 0, .width = 0, .height = 0 };
+    }
+
+    // Ensure atlas exists
+    if (atlas_ptr.* == null) {
+        atlas_ptr.* = FontAtlas.init(alloc, 512, .grayscale) catch return null;
+    }
+    var atlas = &atlas_ptr.*.?;
+
+    // Copy source bitmap to tightly-packed buffer (FreeType pitch may != width)
+    const tight = alloc.alloc(u8, width * height) catch return null;
+    defer alloc.free(tight);
+    const src = src_buffer orelse return null;
+    for (0..height) |row| {
+        const src_offset = row * src_pitch;
+        const dst_offset = row * width;
+        @memcpy(tight[dst_offset..][0..width], src[src_offset..][0..width]);
+    }
+
+    // Try to reserve space; grow atlas if full (up to reasonable max)
+    var region = atlas.reserve(alloc, width, height) catch |err| switch (err) {
+        error.AtlasFull => blk: {
+            const new_size = atlas.size * 2;
+            if (new_size > 8192) return null; // Safety cap
+            std.debug.print("Atlas full ({0}x{0}), growing to {1}x{1}\n", .{ atlas.size, new_size });
+            atlas.grow(alloc, new_size) catch return null;
+            break :blk atlas.reserve(alloc, width, height) catch return null;
+        },
+        else => return null,
+    };
+
+    // Copy pixels into atlas
+    atlas.set(region, tight);
+
+    // Ensure region dimensions match what we asked for
+    region.width = width;
+    region.height = height;
+
+    return region;
+}
+
+/// Pack a tightly-packed pixel buffer into an atlas (no pitch conversion needed).
+fn packPixelsIntoAtlas(
+    atlas_ptr: *?FontAtlas,
+    alloc: std.mem.Allocator,
+    width: u32,
+    height: u32,
+    pixels: []const u8,
+) ?FontAtlas.Region {
+    if (width == 0 or height == 0) {
+        return .{ .x = 0, .y = 0, .width = 0, .height = 0 };
+    }
+
+    if (atlas_ptr.* == null) {
+        atlas_ptr.* = FontAtlas.init(alloc, 512, .grayscale) catch return null;
+    }
+    var atlas = &atlas_ptr.*.?;
+
+    var region = atlas.reserve(alloc, width, height) catch |err| switch (err) {
+        error.AtlasFull => blk: {
+            const new_size = atlas.size * 2;
+            if (new_size > 8192) return null;
+            std.debug.print("Atlas full ({0}x{0}), growing to {1}x{1}\n", .{ atlas.size, new_size });
+            atlas.grow(alloc, new_size) catch return null;
+            break :blk atlas.reserve(alloc, width, height) catch return null;
+        },
+        else => return null,
+    };
+
+    atlas.set(region, pixels);
+    region.width = width;
+    region.height = height;
+
+    return region;
 }
 
 /// Find or load a fallback font that contains the given codepoint
@@ -608,25 +701,8 @@ fn loadSpriteGlyph(codepoint: u32, alloc: std.mem.Allocator) ?Character {
         @memcpy(trimmed_data[dst_start..][0..r.width], r.data[src_start..][0..r.width]);
     }
 
-    // Create OpenGL texture from trimmed sprite data
-    var texture: c.GLuint = 0;
-    gl.GenTextures.?(1, &texture);
-    gl.BindTexture.?(c.GL_TEXTURE_2D, texture);
-    gl.TexImage2D.?(
-        c.GL_TEXTURE_2D,
-        0,
-        c.GL_RED,
-        @intCast(r.width),
-        @intCast(r.height),
-        0,
-        c.GL_RED,
-        c.GL_UNSIGNED_BYTE,
-        trimmed_data.ptr,
-    );
-    gl.TexParameteri.?(c.GL_TEXTURE_2D, c.GL_TEXTURE_WRAP_S, c.GL_CLAMP_TO_EDGE);
-    gl.TexParameteri.?(c.GL_TEXTURE_2D, c.GL_TEXTURE_WRAP_T, c.GL_CLAMP_TO_EDGE);
-    gl.TexParameteri.?(c.GL_TEXTURE_2D, c.GL_TEXTURE_MIN_FILTER, c.GL_LINEAR);
-    gl.TexParameteri.?(c.GL_TEXTURE_2D, c.GL_TEXTURE_MAG_FILTER, c.GL_LINEAR);
+    // Pack into font atlas
+    const region = packPixelsIntoAtlas(&g_atlas, alloc, @intCast(r.width), @intCast(r.height), trimmed_data) orelse return null;
 
     // Calculate glyph offsets like Ghostty does:
     // Ghostty: offset_x = clip_left - padding_x  
@@ -655,7 +731,7 @@ fn loadSpriteGlyph(codepoint: u32, alloc: std.mem.Allocator) ?Character {
     const bearing_y = offset_y - baseline_i;
 
     return Character{
-        .texture_id = texture,
+        .region = region,
         .size_x = @intCast(r.width),
         .size_y = @intCast(r.height),
         .bearing_x = offset_x,
@@ -872,33 +948,117 @@ fn indexToRgb(color_idx: u8) [3]f32 {
     }
 }
 
+/// Sync the font atlas CPU data to the GPU texture.
+/// Called once per frame before rendering. Only uploads if the atlas was modified.
+fn syncAtlasTexture(atlas_ptr: *?FontAtlas, texture_ptr: *c.GLuint, modified_ptr: *usize) void {
+    const atlas = atlas_ptr.*.?;
+    const modified = atlas.modified.load(.monotonic);
+    if (modified <= modified_ptr.*) return;
+
+    const size: c_int = @intCast(atlas.size);
+
+    if (texture_ptr.* == 0) {
+        // First time — create the texture
+        gl.GenTextures.?(1, texture_ptr);
+        gl.BindTexture.?(c.GL_TEXTURE_2D, texture_ptr.*);
+        gl.TexImage2D.?(c.GL_TEXTURE_2D, 0, c.GL_RED, size, size, 0, c.GL_RED, c.GL_UNSIGNED_BYTE, atlas.data.ptr);
+        gl.TexParameteri.?(c.GL_TEXTURE_2D, c.GL_TEXTURE_WRAP_S, c.GL_CLAMP_TO_EDGE);
+        gl.TexParameteri.?(c.GL_TEXTURE_2D, c.GL_TEXTURE_WRAP_T, c.GL_CLAMP_TO_EDGE);
+        gl.TexParameteri.?(c.GL_TEXTURE_2D, c.GL_TEXTURE_MIN_FILTER, c.GL_LINEAR);
+        gl.TexParameteri.?(c.GL_TEXTURE_2D, c.GL_TEXTURE_MAG_FILTER, c.GL_LINEAR);
+    } else {
+        gl.BindTexture.?(c.GL_TEXTURE_2D, texture_ptr.*);
+        // Check if atlas grew beyond current GPU texture size
+        var current_size: c.GLint = 0;
+        gl.GetTexLevelParameteriv.?(c.GL_TEXTURE_2D, 0, c.GL_TEXTURE_WIDTH, &current_size);
+        if (current_size < size) {
+            // Atlas grew — need a new texture
+            gl.DeleteTextures.?(1, texture_ptr);
+            gl.GenTextures.?(1, texture_ptr);
+            gl.BindTexture.?(c.GL_TEXTURE_2D, texture_ptr.*);
+            gl.TexImage2D.?(c.GL_TEXTURE_2D, 0, c.GL_RED, size, size, 0, c.GL_RED, c.GL_UNSIGNED_BYTE, atlas.data.ptr);
+            gl.TexParameteri.?(c.GL_TEXTURE_2D, c.GL_TEXTURE_WRAP_S, c.GL_CLAMP_TO_EDGE);
+            gl.TexParameteri.?(c.GL_TEXTURE_2D, c.GL_TEXTURE_WRAP_T, c.GL_CLAMP_TO_EDGE);
+            gl.TexParameteri.?(c.GL_TEXTURE_2D, c.GL_TEXTURE_MIN_FILTER, c.GL_LINEAR);
+            gl.TexParameteri.?(c.GL_TEXTURE_2D, c.GL_TEXTURE_MAG_FILTER, c.GL_LINEAR);
+        } else {
+            // Same size — sub-image upload
+            gl.TexSubImage2D.?(c.GL_TEXTURE_2D, 0, 0, 0, size, size, c.GL_RED, c.GL_UNSIGNED_BYTE, atlas.data.ptr);
+        }
+    }
+
+    modified_ptr.* = modified;
+}
+
+/// Render an icon glyph centered within a button rect, using the icon atlas.
+fn renderIconGlyph(ch: Character, btn_x: f32, btn_y: f32, btn_w: f32, btn_h: f32, color: [3]f32, scale: f32) void {
+    if (ch.region.width == 0 or ch.region.height == 0) return;
+
+    const gw = @as(f32, @floatFromInt(ch.size_x)) * scale;
+    const gh = @as(f32, @floatFromInt(ch.size_y)) * scale;
+    const gx = btn_x + (btn_w - gw) / 2;
+    const gy = btn_y + (btn_h - gh) / 2;
+
+    const icon_atlas_size = if (g_icon_atlas) |a| @as(f32, @floatFromInt(a.size)) else 512.0;
+    const uv = glyphUV(ch.region, icon_atlas_size);
+
+    const vertices = [6][4]f32{
+        .{ gx, gy + gh, uv.u0, uv.v0 },
+        .{ gx, gy, uv.u0, uv.v1 },
+        .{ gx + gw, gy, uv.u1, uv.v1 },
+        .{ gx, gy + gh, uv.u0, uv.v0 },
+        .{ gx + gw, gy, uv.u1, uv.v1 },
+        .{ gx + gw, gy + gh, uv.u1, uv.v0 },
+    };
+
+    gl.Uniform3f.?(gl.GetUniformLocation.?(shader_program, "textColor"), color[0], color[1], color[2]);
+    gl.BindTexture.?(c.GL_TEXTURE_2D, g_icon_atlas_texture);
+    gl.BindBuffer.?(c.GL_ARRAY_BUFFER, vbo);
+    gl.BufferSubData.?(c.GL_ARRAY_BUFFER, 0, @sizeOf(@TypeOf(vertices)), &vertices);
+    gl.BindBuffer.?(c.GL_ARRAY_BUFFER, 0);
+    gl.DrawArrays.?(c.GL_TRIANGLES, 0, 6);
+}
+
+/// Compute UV coordinates from an atlas region and atlas size.
+const GlyphUV = struct { u0: f32, v0: f32, u1: f32, v1: f32 };
+fn glyphUV(region: FontAtlas.Region, atlas_size: f32) GlyphUV {
+    return .{
+        .u0 = @as(f32, @floatFromInt(region.x)) / atlas_size,
+        .v0 = @as(f32, @floatFromInt(region.y)) / atlas_size,
+        .u1 = @as(f32, @floatFromInt(region.x + region.width)) / atlas_size,
+        .v1 = @as(f32, @floatFromInt(region.y + region.height)) / atlas_size,
+    };
+}
+
 fn renderChar(codepoint: u32, x: f32, y: f32, color: [3]f32) void {
     // Skip control characters
     if (codepoint < 32) return;
 
     // Get character from cache (load on-demand if needed)
     const ch: Character = loadGlyph(codepoint) orelse return;
+    if (ch.region.width == 0 or ch.region.height == 0) return;
 
     // Position glyph relative to baseline (like Ghostty)
-    // y = cell bottom, cell_baseline = distance from cell bottom to baseline
-    // bearing_y (bitmap_top) = distance from baseline to glyph top
-    // y0 = glyph bottom = cell_bottom + cell_baseline + bearing_y - glyph_height
     const x0 = x + @as(f32, @floatFromInt(ch.bearing_x));
     const y0 = y + cell_baseline - @as(f32, @floatFromInt(ch.size_y - ch.bearing_y));
     const w = @as(f32, @floatFromInt(ch.size_x));
     const h = @as(f32, @floatFromInt(ch.size_y));
 
+    // Compute atlas UVs from region
+    const atlas_size = if (g_atlas) |a| @as(f32, @floatFromInt(a.size)) else 512.0;
+    const uv = glyphUV(ch.region, atlas_size);
+
     const vertices = [6][4]f32{
-        .{ x0, y0 + h, 0.0, 0.0 },
-        .{ x0, y0, 0.0, 1.0 },
-        .{ x0 + w, y0, 1.0, 1.0 },
-        .{ x0, y0 + h, 0.0, 0.0 },
-        .{ x0 + w, y0, 1.0, 1.0 },
-        .{ x0 + w, y0 + h, 1.0, 0.0 },
+        .{ x0, y0 + h, uv.u0, uv.v0 },
+        .{ x0, y0, uv.u0, uv.v1 },
+        .{ x0 + w, y0, uv.u1, uv.v1 },
+        .{ x0, y0 + h, uv.u0, uv.v0 },
+        .{ x0 + w, y0, uv.u1, uv.v1 },
+        .{ x0 + w, y0 + h, uv.u1, uv.v0 },
     };
 
     gl.Uniform3f.?(gl.GetUniformLocation.?(shader_program, "textColor"), color[0], color[1], color[2]);
-    gl.BindTexture.?(c.GL_TEXTURE_2D, ch.texture_id);
+    gl.BindTexture.?(c.GL_TEXTURE_2D, g_atlas_texture);
     gl.BindBuffer.?(c.GL_ARRAY_BUFFER, vbo);
     gl.BufferSubData.?(c.GL_ARRAY_BUFFER, 0, @sizeOf(@TypeOf(vertices)), &vertices);
     gl.BindBuffer.?(c.GL_ARRAY_BUFFER, 0);
@@ -918,6 +1078,7 @@ fn glyphAdvanceScaled(codepoint: u32, scale: f32) f32 {
 fn renderCharScaled(codepoint: u32, x: f32, y: f32, color: [3]f32, scale: f32) void {
     if (codepoint < 32) return;
     const ch: Character = loadGlyph(codepoint) orelse return;
+    if (ch.region.width == 0 or ch.region.height == 0) return;
 
     const w = @as(f32, @floatFromInt(ch.size_x)) * scale;
     const h = @as(f32, @floatFromInt(ch.size_y)) * scale;
@@ -928,17 +1089,20 @@ fn renderCharScaled(codepoint: u32, x: f32, y: f32, color: [3]f32, scale: f32) v
     const x0 = x + bearing_x;
     const y0 = y + cell_baseline * scale - (size_y - bearing_y);
 
+    const atlas_size = if (g_atlas) |a| @as(f32, @floatFromInt(a.size)) else 512.0;
+    const uv = glyphUV(ch.region, atlas_size);
+
     const vertices = [6][4]f32{
-        .{ x0, y0 + h, 0.0, 0.0 },
-        .{ x0, y0, 0.0, 1.0 },
-        .{ x0 + w, y0, 1.0, 1.0 },
-        .{ x0, y0 + h, 0.0, 0.0 },
-        .{ x0 + w, y0, 1.0, 1.0 },
-        .{ x0 + w, y0 + h, 1.0, 0.0 },
+        .{ x0, y0 + h, uv.u0, uv.v0 },
+        .{ x0, y0, uv.u0, uv.v1 },
+        .{ x0 + w, y0, uv.u1, uv.v1 },
+        .{ x0, y0 + h, uv.u0, uv.v0 },
+        .{ x0 + w, y0, uv.u1, uv.v1 },
+        .{ x0 + w, y0 + h, uv.u1, uv.v0 },
     };
 
     gl.Uniform3f.?(gl.GetUniformLocation.?(shader_program, "textColor"), color[0], color[1], color[2]);
-    gl.BindTexture.?(c.GL_TEXTURE_2D, ch.texture_id);
+    gl.BindTexture.?(c.GL_TEXTURE_2D, g_atlas_texture);
     gl.BindBuffer.?(c.GL_ARRAY_BUFFER, vbo);
     gl.BufferSubData.?(c.GL_ARRAY_BUFFER, 0, @sizeOf(@TypeOf(vertices)), &vertices);
     gl.BindBuffer.?(c.GL_ARRAY_BUFFER, 0);
@@ -1177,26 +1341,7 @@ fn renderTitlebar(window_width: f32, window_height: f32, titlebar_h: f32) void {
         const plus_scale: f32 = 1.15;
         if (icon_face != null) {
             if (loadIconGlyph(0xE948)) |ch| {
-                const gw = @as(f32, @floatFromInt(ch.size_x)) * plus_scale;
-                const gh = @as(f32, @floatFromInt(ch.size_y)) * plus_scale;
-                const gx = cursor_x + (plus_btn_w - gw) / 2;
-                const gy = tb_top + (titlebar_h + gh) / 2 - @as(f32, @floatFromInt(ch.bearing_y)) * plus_scale;
-
-                const vertices = [6][4]f32{
-                    .{ gx, gy + gh, 0.0, 0.0 },
-                    .{ gx, gy, 0.0, 1.0 },
-                    .{ gx + gw, gy, 1.0, 1.0 },
-                    .{ gx, gy + gh, 0.0, 0.0 },
-                    .{ gx + gw, gy, 1.0, 1.0 },
-                    .{ gx + gw, gy + gh, 1.0, 0.0 },
-                };
-
-                gl.Uniform3f.?(gl.GetUniformLocation.?(shader_program, "textColor"), plus_icon_color[0], plus_icon_color[1], plus_icon_color[2]);
-                gl.BindTexture.?(c.GL_TEXTURE_2D, ch.texture_id);
-                gl.BindBuffer.?(c.GL_ARRAY_BUFFER, vbo);
-                gl.BufferSubData.?(c.GL_ARRAY_BUFFER, 0, @sizeOf(@TypeOf(vertices)), &vertices);
-                gl.BindBuffer.?(c.GL_ARRAY_BUFFER, 0);
-                gl.DrawArrays.?(c.GL_TRIANGLES, 0, 6);
+                renderIconGlyph(ch, cursor_x, tb_top, plus_btn_w, titlebar_h, plus_icon_color, plus_scale);
             }
         } else {
             const plus_cx = cursor_x + plus_btn_w / 2;
@@ -1304,27 +1449,7 @@ fn renderCaptionButton(x: f32, y: f32, w: f32, h: f32, btn_type: CaptionButtonTy
     // Try rendering from Segoe MDL2 Assets icon font
     if (icon_face != null) {
         if (loadIconGlyph(icon_codepoint)) |ch| {
-            const gw = @as(f32, @floatFromInt(ch.size_x));
-            const gh = @as(f32, @floatFromInt(ch.size_y));
-            // Center the glyph bitmap in the button (ignore baseline positioning)
-            const gx = x + (w - gw) / 2;
-            const gy = y + (h - gh) / 2;
-
-            const vertices = [6][4]f32{
-                .{ gx, gy + gh, 0.0, 0.0 },
-                .{ gx, gy, 0.0, 1.0 },
-                .{ gx + gw, gy, 1.0, 1.0 },
-                .{ gx, gy + gh, 0.0, 0.0 },
-                .{ gx + gw, gy, 1.0, 1.0 },
-                .{ gx + gw, gy + gh, 1.0, 0.0 },
-            };
-
-            gl.Uniform3f.?(gl.GetUniformLocation.?(shader_program, "textColor"), icon_color[0], icon_color[1], icon_color[2]);
-            gl.BindTexture.?(c.GL_TEXTURE_2D, ch.texture_id);
-            gl.BindBuffer.?(c.GL_ARRAY_BUFFER, vbo);
-            gl.BufferSubData.?(c.GL_ARRAY_BUFFER, 0, @sizeOf(@TypeOf(vertices)), &vertices);
-            gl.BindBuffer.?(c.GL_ARRAY_BUFFER, 0);
-            gl.DrawArrays.?(c.GL_TRIANGLES, 0, 6);
+            renderIconGlyph(ch, x, y, w, h, icon_color, 1.0);
             return;
         }
     }
@@ -1384,28 +1509,18 @@ fn loadIconGlyph(codepoint: u32) ?Character {
     const glyph = face.handle.*.glyph;
     const bitmap = glyph.*.bitmap;
 
-    var texture: c.GLuint = 0;
-    gl.GenTextures.?(1, &texture);
-    gl.BindTexture.?(c.GL_TEXTURE_2D, texture);
-
-    if (bitmap.width > 0 and bitmap.rows > 0) {
-        gl.TexImage2D.?(
-            c.GL_TEXTURE_2D, 0, c.GL_RED,
-            @intCast(bitmap.width), @intCast(bitmap.rows),
-            0, c.GL_RED, c.GL_UNSIGNED_BYTE, bitmap.buffer,
-        );
-    } else {
-        const empty: [1]u8 = .{0};
-        gl.TexImage2D.?(c.GL_TEXTURE_2D, 0, c.GL_RED, 1, 1, 0, c.GL_RED, c.GL_UNSIGNED_BYTE, &empty);
-    }
-
-    gl.TexParameteri.?(c.GL_TEXTURE_2D, c.GL_TEXTURE_WRAP_S, c.GL_CLAMP_TO_EDGE);
-    gl.TexParameteri.?(c.GL_TEXTURE_2D, c.GL_TEXTURE_WRAP_T, c.GL_CLAMP_TO_EDGE);
-    gl.TexParameteri.?(c.GL_TEXTURE_2D, c.GL_TEXTURE_MIN_FILTER, c.GL_NEAREST);
-    gl.TexParameteri.?(c.GL_TEXTURE_2D, c.GL_TEXTURE_MAG_FILTER, c.GL_NEAREST);
+    // Pack into icon atlas
+    const region = packBitmapIntoAtlas(
+        &g_icon_atlas,
+        alloc,
+        bitmap.width,
+        bitmap.rows,
+        bitmap.buffer,
+        @intCast(bitmap.pitch),
+    ) orelse return null;
 
     const ch = Character{
-        .texture_id = texture,
+        .region = region,
         .size_x = @intCast(bitmap.width),
         .size_y = @intCast(bitmap.rows),
         .bearing_x = @intCast(glyph.*.bitmap_left),
@@ -2016,12 +2131,19 @@ fn updateCursorBlink() void {
 
 /// Clear all GL textures from the glyph cache and reset it.
 fn clearGlyphCache(allocator: std.mem.Allocator) void {
-    var it = glyph_cache.iterator();
-    while (it.next()) |entry| {
-        gl.DeleteTextures.?(1, &entry.value_ptr.texture_id);
-    }
     glyph_cache.deinit(allocator);
     glyph_cache = .empty;
+
+    // Reset atlas — destroy GPU texture and CPU data, recreate fresh
+    if (g_atlas) |*a| {
+        a.deinit(allocator);
+        g_atlas = null;
+    }
+    if (g_atlas_texture != 0) {
+        gl.DeleteTextures.?(1, &g_atlas_texture);
+        g_atlas_texture = 0;
+        g_atlas_modified = 0;
+    }
 }
 
 /// Clear fallback font faces.
@@ -2363,6 +2485,10 @@ const glfw_callbacks = if (!build_options.use_win32) struct {
         }
 
         if (!g_resize_in_progress) {
+            // Sync atlas before rendering
+            if (g_atlas != null) syncAtlasTexture(&g_atlas, &g_atlas_texture, &g_atlas_modified);
+            if (g_icon_atlas != null) syncAtlasTexture(&g_icon_atlas, &g_icon_atlas_texture, &g_icon_atlas_modified);
+
             if (activeSurface()) |surface| {
                 surface.render_state.mutex.lock();
                 defer surface.render_state.mutex.unlock();
@@ -3321,15 +3447,19 @@ pub fn main() !void {
         // Clean up the current font face (may have been replaced by hot-reload)
         if (glyph_face) |f| f.deinit();
         glyph_face = null;
-        // Clean up glyph cache textures
+        // Clean up glyph cache and atlas
         clearGlyphCache(allocator);
         clearFallbackFaces(allocator);
-        // Clean up icon cache
-        var icon_it = icon_cache.iterator();
-        while (icon_it.next()) |entry| {
-            gl.DeleteTextures.?(1, &entry.value_ptr.texture_id);
-        }
+        // Clean up icon cache and icon atlas
         icon_cache.deinit(allocator);
+        if (g_icon_atlas) |*a| {
+            a.deinit(allocator);
+            g_icon_atlas = null;
+        }
+        if (g_icon_atlas_texture != 0) {
+            gl.DeleteTextures.?(1, &g_icon_atlas_texture);
+            g_icon_atlas_texture = 0;
+        }
     }
     initSolidTexture();
 
@@ -3458,6 +3588,10 @@ pub fn main() !void {
 
             updateFps();
 
+            // Sync atlas textures to GPU if modified
+            if (g_atlas != null) syncAtlasTexture(&g_atlas, &g_atlas_texture, &g_atlas_modified);
+            if (g_icon_atlas != null) syncAtlasTexture(&g_icon_atlas, &g_icon_atlas_texture, &g_icon_atlas_modified);
+
             if (g_post_enabled) {
                 if (activeSurface()) |surface| {
                     surface.render_state.mutex.lock();
@@ -3491,6 +3625,10 @@ pub fn main() !void {
             c.glfwGetFramebufferSize(glfw_window, &fb_width, &fb_height);
 
             updateFps();
+
+            // Sync atlas textures to GPU if modified
+            if (g_atlas != null) syncAtlasTexture(&g_atlas, &g_atlas_texture, &g_atlas_modified);
+            if (g_icon_atlas != null) syncAtlasTexture(&g_icon_atlas, &g_icon_atlas_texture, &g_icon_atlas_modified);
 
             if (g_post_enabled) {
                 if (activeSurface()) |surface| {
