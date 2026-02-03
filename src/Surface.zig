@@ -16,7 +16,16 @@ const renderer = @import("renderer.zig");
 const termio = @import("termio.zig");
 const Config = @import("config.zig");
 
+const windows = std.os.windows;
+
 const Surface = @This();
+
+/// CancelIoEx is not exposed by Zig's std library.
+/// We import it directly from kernel32.
+extern "kernel32" fn CancelIoEx(
+    hFile: windows.HANDLE,
+    lpOverlapped: ?*windows.OVERLAPPED,
+) callconv(.winapi) windows.BOOL;
 
 // ============================================================================
 // Types
@@ -141,18 +150,26 @@ pub fn init(
 /// Deinitialize and free a Surface.
 /// Stops the IO thread first, then cleans up PTY and terminal.
 pub fn deinit(self: *Surface, allocator: std.mem.Allocator) void {
-    // 1. Close the PTY read pipe to unblock the IO thread's ReadFile().
-    //    This causes ReadFile to fail with BROKEN_PIPE, which makes
-    //    the thread exit its loop and return.
-    self.pty.closeReadPipe();
+    // 1. Signal the IO thread to stop.
+    self.exited.store(true, .release);
 
-    // 2. Join the IO thread — wait for it to finish.
     if (self.io_thread) |thread| {
+        // Cancel the blocking ReadFile on the pipe handle.
+        // Must happen BEFORE closing the handle (like Ghostty does).
+        const read_handle = self.pty.pipe_in_read;
+        if (read_handle != windows.INVALID_HANDLE_VALUE) {
+            _ = CancelIoEx(read_handle, null);
+        }
+
+        // Close the read pipe — causes ReadFile to fail with BROKEN_PIPE
+        // if CancelIoEx didn't already unblock it.
+        self.pty.closeReadPipe();
+
         thread.join();
         self.io_thread = null;
     }
 
-    // 3. Now safe to tear down everything — no other thread is accessing.
+    // 2. Now safe to tear down everything — no other thread is accessing.
     self.pty.deinit();
     self.terminal.deinit(allocator);
     allocator.destroy(self);
