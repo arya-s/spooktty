@@ -287,8 +287,12 @@ fn shellFriendlyName(title: []const u8) []const u8 {
 }
 
 /// Update the surface title from an OSC sequence.
+/// Like Ghostty, reject titles that aren't valid UTF-8 — this filters out
+/// garbage from random byte streams (e.g. cat /dev/urandom) that happen to
+/// form accidental OSC sequences.
 fn updateTitle(self: *Surface, title: []const u8, osc_num: u8) void {
     if (title.len == 0) return;
+    if (!std.unicode.utf8ValidateSlice(title)) return;
 
     if (osc_num == '7') {
         // OSC 7: file://host/path — extract the path

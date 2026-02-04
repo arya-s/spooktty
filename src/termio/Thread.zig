@@ -63,11 +63,13 @@ pub fn threadMain(surface: *Surface) void {
             stream.nextSlice(data) catch {};
             surface.scanForOscTitle(data);
 
-            // Coalesce: drain any additional data already in the pipe
-            // so we don't release the lock mid-sequence. This handles
-            // the common case where ConPTY writes a batch of data as
-            // multiple small pipe writes that arrive back-to-back.
-            while (true) {
+            // Coalesce: drain a limited amount of additional data already
+            // in the pipe so we don't release the lock mid-sequence.
+            // Cap iterations to avoid holding the lock indefinitely when
+            // the child produces data faster than we render (e.g. cat /dev/urandom).
+            const MAX_COALESCE = 16;
+            var coalesce_count: usize = 0;
+            while (coalesce_count < MAX_COALESCE) : (coalesce_count += 1) {
                 var avail: windows.DWORD = 0;
                 if (PeekNamedPipe(surface.pty.pipe_in_read, null, 0, null, &avail, null) == 0)
                     break;
