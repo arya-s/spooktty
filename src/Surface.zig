@@ -110,6 +110,7 @@ pub fn init(
         .cols = cols,
         .rows = rows,
         .max_scrollback = scrollback_limit,
+        .default_modes = .{ .grapheme_cluster = true },
     }) catch |err| {
         return err;
     };

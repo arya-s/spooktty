@@ -1,6 +1,7 @@
 const std = @import("std");
 const ghostty_vt = @import("ghostty-vt");
 const freetype = @import("freetype");
+const harfbuzz = @import("harfbuzz");
 const Pty = @import("pty.zig").Pty;
 const sprite = @import("font/sprite.zig");
 const directwrite = @import("directwrite.zig");
@@ -296,10 +297,13 @@ const Character = struct {
     bearing_y: i32,
     advance: i64,
     valid: bool = false,
+    is_color: bool = false, // true if stored in BGRA color atlas (emoji)
 };
 
 // Glyph cache using a hashmap for Unicode support
 var glyph_cache: std.AutoHashMapUnmanaged(u32, Character) = .empty;
+// Grapheme cluster cache — keyed by hash of full codepoint sequence
+var grapheme_cache: std.AutoHashMapUnmanaged(u64, Character) = .empty;
 var glyph_face: ?freetype.Face = null;
 var icon_face: ?freetype.Face = null; // Segoe MDL2 Assets for caption button icons
 var icon_cache: std.AutoHashMapUnmanaged(u32, Character) = .empty;
@@ -308,6 +312,11 @@ var icon_cache: std.AutoHashMapUnmanaged(u32, Character) = .empty;
 var g_atlas: ?FontAtlas = null;
 var g_atlas_texture: c.GLuint = 0;
 var g_atlas_modified: usize = 0; // Last synced modified counter
+
+// Color atlas — BGRA texture for color emoji (like Ghostty's separate color atlas)
+var g_color_atlas: ?FontAtlas = null;
+var g_color_atlas_texture: c.GLuint = 0;
+var g_color_atlas_modified: usize = 0;
 
 // Icon atlas — separate atlas for caption button icons (Segoe MDL2)
 var g_icon_atlas: ?FontAtlas = null;
@@ -362,15 +371,21 @@ const CellFg = extern struct {
 const MAX_CELLS = 30000;
 var bg_cells: [MAX_CELLS]CellBg = undefined;
 var fg_cells: [MAX_CELLS]CellFg = undefined;
+var color_fg_cells: [MAX_CELLS]CellFg = undefined; // Color emoji cells (separate draw pass)
 var bg_cell_count: usize = 0;
 var fg_cell_count: usize = 0;
+var color_fg_cell_count: usize = 0;
 
 // Snapshot buffer: resolved cell data copied under the lock so that
 // rebuildCells can run outside the lock (like Ghostty's RenderState).
+const MAX_GRAPHEME: usize = 8; // Max codepoints per grapheme cluster (covers flags, ZWJ sequences, etc.)
 const SnapCell = struct {
     codepoint: u21,
     fg: [3]f32,
     bg: ?[3]f32,
+    wide: enum(u2) { narrow = 0, wide = 1, spacer_tail = 2, spacer_head = 3 } = .narrow,
+    grapheme: [MAX_GRAPHEME]u21 = .{0} ** MAX_GRAPHEME,
+    grapheme_len: u4 = 0, // 0 = single codepoint, >0 = multi-codepoint cluster
 };
 const MAX_SNAP = MAX_CELLS;
 var g_snap: [MAX_SNAP]SnapCell = undefined;
@@ -399,10 +414,13 @@ var g_last_selection_active: bool = false; // detect selection changes
 // GL objects for instanced rendering
 var bg_shader: c.GLuint = 0;
 var fg_shader: c.GLuint = 0;
+var color_fg_shader: c.GLuint = 0; // Color emoji shader (BGRA sampling)
 var bg_vao: c.GLuint = 0;
 var fg_vao: c.GLuint = 0;
+var color_fg_vao: c.GLuint = 0;
 var bg_instance_vbo: c.GLuint = 0;
 var fg_instance_vbo: c.GLuint = 0;
+var color_fg_instance_vbo: c.GLuint = 0;
 var quad_vbo: c.GLuint = 0; // shared unit quad for instanced draws
 
 // --- Instanced shader sources ---
@@ -475,6 +493,20 @@ const fg_fragment_source: [*c]const u8 =
     \\    fragColor = vec4(vColor, 1.0) * vec4(1.0, 1.0, 1.0, a);
     \\}
 ;
+
+// Color emoji fragment shader — samples RGBA directly from the color atlas.
+// FreeType's color emoji bitmaps (CBDT/CBLC) use premultiplied alpha,
+// so we output them directly and use premultiplied blend mode (GL_ONE, GL_ONE_MINUS_SRC_ALPHA).
+const color_fg_fragment_source: [*c]const u8 =
+    \\#version 330 core
+    \\in vec2 vTexCoord;
+    \\flat in vec3 vColor;
+    \\uniform sampler2D atlas;
+    \\out vec4 fragColor;
+    \\void main() {
+    \\    fragColor = texture(atlas, vTexCoord);
+    \\}
+;
 var cell_width: f32 = 10;
 var cell_height: f32 = 20;
 var cell_baseline: f32 = 4; // Distance from bottom of cell to baseline
@@ -531,6 +563,11 @@ var g_ft_lib: ?freetype.Library = null;
 var g_font_discovery: ?*directwrite.FontDiscovery = null;
 var g_fallback_faces: std.AutoHashMapUnmanaged(u32, freetype.Face) = .empty; // codepoint -> fallback face
 var g_font_size: u32 = DEFAULT_FONT_SIZE;
+
+// HarfBuzz shaping state
+var g_hb_buf: ?harfbuzz.Buffer = null;
+var g_hb_font: ?harfbuzz.Font = null; // HB font for primary face
+var g_hb_fallback_fonts: std.AutoHashMapUnmanaged(u32, harfbuzz.Font) = .empty; // codepoint -> HB font for fallback faces
 
 const vertex_shader_source: [*c]const u8 =
     \\#version 330 core
@@ -717,11 +754,39 @@ fn initInstancedBuffers() void {
 
     gl.BindVertexArray.?(0);
 
+    // --- Color FG VAO (same layout as FG, separate buffer for color emoji) ---
+    gl.GenVertexArrays.?(1, &color_fg_vao);
+    gl.GenBuffers.?(1, &color_fg_instance_vbo);
+    gl.BindVertexArray.?(color_fg_vao);
+
+    gl.BindBuffer.?(c.GL_ARRAY_BUFFER, quad_vbo);
+    gl.EnableVertexAttribArray.?(0);
+    gl.VertexAttribPointer.?(0, 2, c.GL_FLOAT, c.GL_FALSE, 2 * @sizeOf(f32), null);
+
+    gl.BindBuffer.?(c.GL_ARRAY_BUFFER, color_fg_instance_vbo);
+    gl.BufferData.?(c.GL_ARRAY_BUFFER, @sizeOf(CellFg) * MAX_CELLS, null, c.GL_STREAM_DRAW);
+    gl.EnableVertexAttribArray.?(1);
+    gl.VertexAttribPointer.?(1, 2, c.GL_FLOAT, c.GL_FALSE, fg_stride, @ptrFromInt(0));
+    gl.VertexAttribDivisor.?(1, 1);
+    gl.EnableVertexAttribArray.?(2);
+    gl.VertexAttribPointer.?(2, 4, c.GL_FLOAT, c.GL_FALSE, fg_stride, @ptrFromInt(2 * @sizeOf(f32)));
+    gl.VertexAttribDivisor.?(2, 1);
+    gl.EnableVertexAttribArray.?(3);
+    gl.VertexAttribPointer.?(3, 4, c.GL_FLOAT, c.GL_FALSE, fg_stride, @ptrFromInt(6 * @sizeOf(f32)));
+    gl.VertexAttribDivisor.?(3, 1);
+    gl.EnableVertexAttribArray.?(4);
+    gl.VertexAttribPointer.?(4, 3, c.GL_FLOAT, c.GL_FALSE, fg_stride, @ptrFromInt(10 * @sizeOf(f32)));
+    gl.VertexAttribDivisor.?(4, 1);
+
+    gl.BindVertexArray.?(0);
+
     // --- Compile instanced shaders ---
     bg_shader = linkProgram(bg_vertex_source, bg_fragment_source);
     fg_shader = linkProgram(fg_vertex_source, fg_fragment_source);
+    color_fg_shader = linkProgram(fg_vertex_source, color_fg_fragment_source);
     if (bg_shader == 0) std.debug.print("BG instanced shader failed\n", .{});
     if (fg_shader == 0) std.debug.print("FG instanced shader failed\n", .{});
+    if (color_fg_shader == 0) std.debug.print("Color FG instanced shader failed\n", .{});
 }
 
 /// Load a single glyph into the cache
@@ -759,14 +824,53 @@ fn loadGlyph(codepoint: u32) ?Character {
         }
     }
 
-    // Use light hinting like Ghostty (matches most fontconfig-aware software)
-    face_to_use.loadGlyph(@intCast(glyph_index), .{ .target = .light }) catch return null;
+    // If still no glyph found, don't render the .notdef tofu box
+    if (glyph_index == 0) return null;
+
+    // Detect if this face has color glyphs (emoji fonts like Segoe UI Emoji, Noto Color Emoji).
+    // Like Ghostty, we set FT_LOAD_COLOR so FreeType renders BGRA bitmaps for color glyphs.
+    const is_color_face = face_to_use.hasColor();
+    face_to_use.loadGlyph(@intCast(glyph_index), .{
+        .target = .light,
+        .color = is_color_face,
+    }) catch return null;
     face_to_use.renderGlyph(.light) catch return null;
 
     const glyph = face_to_use.handle.*.glyph;
     const bitmap = glyph.*.bitmap;
 
-    // Pack glyph bitmap into the font atlas
+    // Check if this glyph actually rendered as BGRA (color emoji)
+    const is_color_glyph = bitmap.pixel_mode == freetype.c.FT_PIXEL_MODE_BGRA;
+
+    if (is_color_glyph) {
+        // Color emoji — pack into BGRA atlas
+        const region = packColorBitmapIntoAtlas(
+            alloc,
+            bitmap.width,
+            bitmap.rows,
+            bitmap.buffer,
+            @intCast(@as(c_uint, @intCast(@abs(bitmap.pitch)))),
+        ) orelse return null;
+
+        // Scale color emoji to fit cell height (like Ghostty's constraint system)
+        // Color emoji bitmaps are often much larger than the cell, so we record
+        // the original bitmap size and let the renderer scale them.
+        const char_data = Character{
+            .region = region,
+            .size_x = @intCast(bitmap.width),
+            .size_y = @intCast(bitmap.rows),
+            .bearing_x = glyph.*.bitmap_left,
+            .bearing_y = glyph.*.bitmap_top,
+            .advance = glyph.*.advance.x,
+            .valid = true,
+            .is_color = true,
+        };
+
+        glyph_cache.put(alloc, codepoint, char_data) catch return null;
+        return char_data;
+    }
+
+    // Grayscale glyph — pack into grayscale atlas
     const region = packBitmapIntoAtlas(
         &g_atlas,
         alloc,
@@ -789,6 +893,206 @@ fn loadGlyph(codepoint: u32) ?Character {
     // Store in cache
     glyph_cache.put(alloc, codepoint, char_data) catch return null;
 
+    return char_data;
+}
+
+/// Returns true if the codepoint is a Regional Indicator Symbol (used for flag emoji).
+fn isRegionalIndicator(cp: u21) bool {
+    return cp >= 0x1F1E6 and cp <= 0x1F1FF;
+}
+
+/// Hash a grapheme cluster (base codepoint + extra codepoints) for cache lookup.
+fn graphemeHash(base_cp: u21, extra: []const u21) u64 {
+    var h = std.hash.Wyhash.init(0);
+    h.update(std.mem.asBytes(&base_cp));
+    for (extra) |cp| {
+        h.update(std.mem.asBytes(&cp));
+    }
+    return h.final();
+}
+
+/// Load a glyph for a grapheme cluster (multi-codepoint emoji) using HarfBuzz shaping.
+/// The cluster is: base_cp followed by extra_cps[0..extra_len].
+/// HarfBuzz shapes the sequence into the correct glyph (flags, skin tones, ZWJ, VS16, etc.)
+fn loadGraphemeGlyph(base_cp: u21, extra_cps: []const u21) ?Character {
+    const hash = graphemeHash(base_cp, extra_cps);
+
+
+    // Check grapheme cache first
+    if (grapheme_cache.get(hash)) |ch| {
+        return ch;
+    }
+
+    const alloc = g_allocator orelse {
+        return null;
+    };
+    var hb_buf = g_hb_buf orelse {
+        return null;
+    };
+
+    // Build the full codepoint sequence: base + extras
+    var codepoints: [1 + MAX_GRAPHEME]u32 = undefined;
+    codepoints[0] = @intCast(base_cp);
+    for (extra_cps, 0..) |cp, i| {
+        codepoints[1 + i] = @intCast(cp);
+    }
+    const total_len = 1 + extra_cps.len;
+
+    // Try primary face first, then fallback
+    const primary_face = glyph_face orelse return null;
+    var face_to_use = primary_face;
+    var hb_font = g_hb_font orelse return null;
+
+    // For multi-codepoint grapheme clusters (emoji sequences), we try the fallback
+    // font (typically an emoji font like Segoe UI Emoji) FIRST, because the primary
+    // monospace font will shape regional indicators / skin tones as separate glyphs
+    // (not composed), and we'd never fall back. The emoji font has GSUB ligatures
+    // that compose these sequences into single glyphs.
+    var glyph_infos: []harfbuzz.GlyphInfo = &.{};
+    var tried_fallback = false;
+
+    if (findOrLoadFallbackFace(@intCast(base_cp), alloc)) |fallback_face| {
+        if (fallback_face.hasColor()) {
+            // Emoji/color font — try this first for grapheme clusters
+            const fb_hb_font = g_hb_fallback_fonts.get(@intCast(base_cp)) orelse blk: {
+                const new_hb = harfbuzz.freetype.createFont(fallback_face.handle) catch null;
+                if (new_hb) |hf| {
+                    g_hb_fallback_fonts.put(alloc, @intCast(base_cp), hf) catch {
+                        var f = hf;
+                        f.destroy();
+                        break :blk null;
+                    };
+                    break :blk hf;
+                }
+                break :blk null;
+            };
+
+            if (fb_hb_font) |fb_font| {
+                hb_buf.reset();
+                hb_buf.addCodepoints(codepoints[0..total_len]);
+                hb_buf.guessSegmentProperties();
+                harfbuzz.shape(fb_font, hb_buf, &.{});
+
+                glyph_infos = hb_buf.getGlyphInfos();
+                tried_fallback = true;
+
+                // Check if the emoji font successfully composed the sequence
+                // (produced a non-.notdef glyph)
+                if (glyph_infos.len > 0 and glyph_infos[0].codepoint != 0) {
+                    face_to_use = fallback_face;
+                    hb_font = fb_font;
+                } else {
+                    // Emoji font didn't help, will try primary below
+                    glyph_infos = &.{};
+                }
+            }
+        }
+    } else {
+    }
+
+    // If fallback didn't produce a result, try primary font
+    if (glyph_infos.len == 0) {
+        hb_buf.reset();
+        hb_buf.addCodepoints(codepoints[0..total_len]);
+        hb_buf.guessSegmentProperties();
+        harfbuzz.shape(hb_font, hb_buf, &.{});
+        glyph_infos = hb_buf.getGlyphInfos();
+
+        // If primary also failed, try non-color fallback
+        if (!tried_fallback and (glyph_infos.len == 0 or glyph_infos[0].codepoint == 0)) {
+            if (findOrLoadFallbackFace(@intCast(base_cp), alloc)) |fallback_face| {
+                const fb_hb_font = g_hb_fallback_fonts.get(@intCast(base_cp)) orelse blk: {
+                    const new_hb = harfbuzz.freetype.createFont(fallback_face.handle) catch null;
+                    if (new_hb) |hf| {
+                        g_hb_fallback_fonts.put(alloc, @intCast(base_cp), hf) catch {
+                            var f = hf;
+                            f.destroy();
+                            break :blk null;
+                        };
+                        break :blk hf;
+                    }
+                    break :blk null;
+                };
+
+                if (fb_hb_font) |fb_font| {
+                    hb_buf.reset();
+                    hb_buf.addCodepoints(codepoints[0..total_len]);
+                    hb_buf.guessSegmentProperties();
+                    harfbuzz.shape(fb_font, hb_buf, &.{});
+
+                    glyph_infos = hb_buf.getGlyphInfos();
+                    if (glyph_infos.len > 0 and glyph_infos[0].codepoint != 0) {
+                        face_to_use = fallback_face;
+                        hb_font = fb_font;
+                    }
+                }
+            }
+        }
+    }
+
+    if (glyph_infos.len == 0 or glyph_infos[0].codepoint == 0) {
+        return null;
+    }
+
+    // Use the first shaped glyph (HarfBuzz composes the sequence into one glyph for emoji)
+    const shaped_glyph_index = glyph_infos[0].codepoint;
+
+    // Render the glyph via FreeType using the glyph index from HarfBuzz
+    const is_color_face = face_to_use.hasColor();
+    face_to_use.loadGlyph(@intCast(shaped_glyph_index), .{
+        .target = .light,
+        .color = is_color_face,
+    }) catch return null;
+    face_to_use.renderGlyph(.light) catch return null;
+
+    const glyph = face_to_use.handle.*.glyph;
+    const bitmap = glyph.*.bitmap;
+
+    const is_color_glyph = bitmap.pixel_mode == freetype.c.FT_PIXEL_MODE_BGRA;
+
+    if (is_color_glyph) {
+        const region = packColorBitmapIntoAtlas(
+            alloc,
+            bitmap.width,
+            bitmap.rows,
+            bitmap.buffer,
+            @intCast(@as(c_uint, @intCast(@abs(bitmap.pitch)))),
+        ) orelse return null;
+
+        const char_data = Character{
+            .region = region,
+            .size_x = @intCast(bitmap.width),
+            .size_y = @intCast(bitmap.rows),
+            .bearing_x = glyph.*.bitmap_left,
+            .bearing_y = glyph.*.bitmap_top,
+            .advance = glyph.*.advance.x,
+            .valid = true,
+            .is_color = true,
+        };
+        grapheme_cache.put(alloc, hash, char_data) catch return null;
+        return char_data;
+    }
+
+    // Grayscale glyph
+    const region = packBitmapIntoAtlas(
+        &g_atlas,
+        alloc,
+        bitmap.width,
+        bitmap.rows,
+        bitmap.buffer,
+        @intCast(bitmap.pitch),
+    ) orelse return null;
+
+    const char_data = Character{
+        .region = region,
+        .size_x = @intCast(bitmap.width),
+        .size_y = @intCast(bitmap.rows),
+        .bearing_x = glyph.*.bitmap_left,
+        .bearing_y = glyph.*.bitmap_top,
+        .advance = glyph.*.advance.x,
+        .valid = true,
+    };
+    grapheme_cache.put(alloc, hash, char_data) catch return null;
     return char_data;
 }
 
@@ -875,6 +1179,53 @@ fn packPixelsIntoAtlas(
     };
 
     atlas.set(region, pixels);
+    region.width = width;
+    region.height = height;
+
+    return region;
+}
+
+/// Pack a BGRA color bitmap into the color emoji atlas.
+/// Handles pitch != width*4 (FreeType BGRA bitmaps may have padding).
+fn packColorBitmapIntoAtlas(
+    alloc: std.mem.Allocator,
+    width: u32,
+    height: u32,
+    src_buffer: ?[*]const u8,
+    src_pitch: u32,
+) ?FontAtlas.Region {
+    if (width == 0 or height == 0) {
+        return .{ .x = 0, .y = 0, .width = 0, .height = 0 };
+    }
+
+    if (g_color_atlas == null) {
+        g_color_atlas = FontAtlas.init(alloc, 512, .bgra) catch return null;
+    }
+    var atlas = &g_color_atlas.?;
+
+    // Copy source bitmap to tightly-packed BGRA buffer
+    const depth: u32 = 4; // BGRA
+    const tight = alloc.alloc(u8, width * height * depth) catch return null;
+    defer alloc.free(tight);
+    const src = src_buffer orelse return null;
+    for (0..height) |row| {
+        const src_offset = row * src_pitch;
+        const dst_offset = row * width * depth;
+        @memcpy(tight[dst_offset..][0..width * depth], src[src_offset..][0..width * depth]);
+    }
+
+    var region = atlas.reserve(alloc, width, height) catch |err| switch (err) {
+        error.AtlasFull => blk: {
+            const new_size = atlas.size * 2;
+            if (new_size > 8192) return null;
+            std.debug.print("Color atlas full ({0}x{0}), growing to {1}x{1}\n", .{ atlas.size, new_size });
+            atlas.grow(alloc, new_size) catch return null;
+            break :blk atlas.reserve(alloc, width, height) catch return null;
+        },
+        else => return null,
+    };
+
+    atlas.set(region, tight);
     region.width = width;
     region.height = height;
 
@@ -1026,6 +1377,13 @@ fn preloadCharacters(face: freetype.Face) void {
 
     // Store face for later on-demand loading
     glyph_face = face;
+
+    // Create HarfBuzz font from primary FreeType face for grapheme cluster shaping
+    if (g_hb_font) |*hf| hf.destroy();
+    g_hb_font = harfbuzz.freetype.createFont(face.handle) catch null;
+    if (g_hb_buf == null) {
+        g_hb_buf = harfbuzz.Buffer.create() catch null;
+    }
 
     std.debug.print("Starting glyph preload, g_allocator set: {}\n", .{g_allocator != null});
 
@@ -1229,6 +1587,7 @@ fn indexToRgb(color_idx: u8) [3]f32 {
 
 /// Sync the font atlas CPU data to the GPU texture.
 /// Called once per frame before rendering. Only uploads if the atlas was modified.
+/// Supports both grayscale (GL_RED) and BGRA (GL_RGBA) atlas formats.
 fn syncAtlasTexture(atlas_ptr: *?FontAtlas, texture_ptr: *c.GLuint, modified_ptr: *usize) void {
     const atlas = atlas_ptr.*.?;
     const modified = atlas.modified.load(.monotonic);
@@ -1236,11 +1595,17 @@ fn syncAtlasTexture(atlas_ptr: *?FontAtlas, texture_ptr: *c.GLuint, modified_ptr
 
     const size: c_int = @intCast(atlas.size);
 
+    // Pick GL format based on atlas pixel format.
+    // FreeType color emoji bitmaps are BGRA byte order, so we upload with GL_BGRA
+    // which tells OpenGL to swizzle B↔R on upload, giving us proper RGBA in the texture.
+    const gl_internal: c.GLint = if (atlas.format == .bgra) c.GL_RGBA8 else c.GL_RED;
+    const gl_format: c.GLenum = if (atlas.format == .bgra) c.GL_BGRA else c.GL_RED;
+
     if (texture_ptr.* == 0) {
         // First time — create the texture
         gl.GenTextures.?(1, texture_ptr);
         gl.BindTexture.?(c.GL_TEXTURE_2D, texture_ptr.*);
-        gl.TexImage2D.?(c.GL_TEXTURE_2D, 0, c.GL_RED, size, size, 0, c.GL_RED, c.GL_UNSIGNED_BYTE, atlas.data.ptr);
+        gl.TexImage2D.?(c.GL_TEXTURE_2D, 0, gl_internal, size, size, 0, gl_format, c.GL_UNSIGNED_BYTE, atlas.data.ptr);
         gl.TexParameteri.?(c.GL_TEXTURE_2D, c.GL_TEXTURE_WRAP_S, c.GL_CLAMP_TO_EDGE);
         gl.TexParameteri.?(c.GL_TEXTURE_2D, c.GL_TEXTURE_WRAP_T, c.GL_CLAMP_TO_EDGE);
         gl.TexParameteri.?(c.GL_TEXTURE_2D, c.GL_TEXTURE_MIN_FILTER, c.GL_LINEAR);
@@ -1255,14 +1620,14 @@ fn syncAtlasTexture(atlas_ptr: *?FontAtlas, texture_ptr: *c.GLuint, modified_ptr
             gl.DeleteTextures.?(1, texture_ptr);
             gl.GenTextures.?(1, texture_ptr);
             gl.BindTexture.?(c.GL_TEXTURE_2D, texture_ptr.*);
-            gl.TexImage2D.?(c.GL_TEXTURE_2D, 0, c.GL_RED, size, size, 0, c.GL_RED, c.GL_UNSIGNED_BYTE, atlas.data.ptr);
+            gl.TexImage2D.?(c.GL_TEXTURE_2D, 0, gl_internal, size, size, 0, gl_format, c.GL_UNSIGNED_BYTE, atlas.data.ptr);
             gl.TexParameteri.?(c.GL_TEXTURE_2D, c.GL_TEXTURE_WRAP_S, c.GL_CLAMP_TO_EDGE);
             gl.TexParameteri.?(c.GL_TEXTURE_2D, c.GL_TEXTURE_WRAP_T, c.GL_CLAMP_TO_EDGE);
             gl.TexParameteri.?(c.GL_TEXTURE_2D, c.GL_TEXTURE_MIN_FILTER, c.GL_LINEAR);
             gl.TexParameteri.?(c.GL_TEXTURE_2D, c.GL_TEXTURE_MAG_FILTER, c.GL_LINEAR);
         } else {
             // Same size — sub-image upload
-            gl.TexSubImage2D.?(c.GL_TEXTURE_2D, 0, 0, 0, size, size, c.GL_RED, c.GL_UNSIGNED_BYTE, atlas.data.ptr);
+            gl.TexSubImage2D.?(c.GL_TEXTURE_2D, 0, 0, 0, size, size, gl_format, c.GL_UNSIGNED_BYTE, atlas.data.ptr);
         }
     }
 
@@ -1958,11 +2323,27 @@ fn snapshotCells(terminal: *ghostty_vt.Terminal) void {
             }
 
             if (row_base + col_idx < MAX_SNAP) {
-                g_snap[row_base + col_idx] = .{
+                var snap: SnapCell = .{
                     .codepoint = cell.codepoint(),
                     .fg = fg_color,
                     .bg = bg_color,
+                    .wide = @enumFromInt(@intFromEnum(cell.wide)),
                 };
+
+                // Store grapheme cluster data for multi-codepoint sequences
+                // (emoji with skin tones, flags, ZWJ sequences, VS16, etc.)
+                if (cell.hasGrapheme()) {
+                    if (p.lookupGrapheme(cell)) |extra_cps| {
+                        const len = @min(extra_cps.len, MAX_GRAPHEME);
+                        for (0..len) |gi| {
+                            snap.grapheme[gi] = extra_cps[gi];
+                        }
+                        snap.grapheme_len = @intCast(len);
+
+                    }
+                }
+
+                g_snap[row_base + col_idx] = snap;
             }
         }
         row_idx += 1;
@@ -1975,14 +2356,17 @@ fn rebuildCells() void {
     const render_rows = g_snap_rows;
     const render_cols = g_snap_cols;
     const atlas_size = if (g_atlas) |a| @as(f32, @floatFromInt(a.size)) else 512.0;
+    const color_atlas_size = if (g_color_atlas) |a| @as(f32, @floatFromInt(a.size)) else 512.0;
 
     bg_cell_count = 0;
     fg_cell_count = 0;
+    color_fg_cell_count = 0;
 
     for (0..render_rows) |row_idx| {
         const row_f: f32 = @floatFromInt(row_idx);
         const row_base = row_idx * render_cols;
 
+        var skip_next_ri = false;
         for (0..render_cols) |col_idx| {
             const snap_idx = row_base + col_idx;
             if (snap_idx >= MAX_SNAP) break;
@@ -2027,32 +2411,109 @@ fn rebuildCells() void {
                 }
             }
 
+            // Skip spacer cells — the wide character's head cell handles rendering
+            // across both cells (like Ghostty).
+            if (sc.wide == .spacer_tail or sc.wide == .spacer_head) continue;
+
+            // Skip the second regional indicator in a composed pair
+            if (skip_next_ri) {
+                skip_next_ri = false;
+                continue;
+            }
+
             const char = sc.codepoint;
             if (char != 0 and char != ' ') {
-                if (loadGlyph(char)) |ch| {
+                // Track if we composed a regional indicator pair (for 2-cell width)
+                var composed_ri_pair = false;
+
+                // Use HarfBuzz shaping for grapheme clusters (multi-codepoint emoji),
+                // fall back to single-codepoint lookup for regular characters.
+                const maybe_ch: ?Character = if (sc.grapheme_len > 0)
+                    loadGraphemeGlyph(char, sc.grapheme[0..sc.grapheme_len])
+                else if (isRegionalIndicator(char)) ri: {
+                    // Regional indicator without grapheme data — check if a following cell
+                    // is also an RI and compose them into a flag pair for shaping.
+                    // This handles the case where grapheme_cluster mode isn't active.
+                    // Check +1 (narrow RI) and +2 (wide RI with spacer_tail at +1).
+                    const offsets = [_]usize{ 1, 2 };
+                    for (offsets) |off| {
+                        const next_snap_idx = row_base + col_idx + off;
+                        if (next_snap_idx < MAX_SNAP and col_idx + off < render_cols) {
+                            const next_sc = g_snap[next_snap_idx];
+                            if (isRegionalIndicator(next_sc.codepoint)) {
+                                const extras = [1]u21{next_sc.codepoint};
+                                const result = loadGraphemeGlyph(char, &extras);
+                                if (result != null) {
+                                    composed_ri_pair = true;
+                                    skip_next_ri = true;
+                                }
+                                break :ri result;
+                            }
+                        }
+                    }
+                    break :ri loadGlyph(char);
+                } else loadGlyph(char);
+                if (maybe_ch) |ch| {
                     if (ch.region.width > 0 and ch.region.height > 0) {
-                        const uv = glyphUV(ch.region, atlas_size);
-                        const gx = @as(f32, @floatFromInt(ch.bearing_x));
-                        const gy = cell_baseline - @as(f32, @floatFromInt(@as(i32, @intCast(ch.size_y)) - ch.bearing_y));
-                        const gw = @as(f32, @floatFromInt(ch.size_x));
-                        const gh = @as(f32, @floatFromInt(ch.size_y));
-                        if (fg_cell_count < MAX_CELLS) {
-                            fg_cells[fg_cell_count] = .{
-                                .grid_col = col_f,
-                                .grid_row = row_f,
-                                .glyph_x = gx,
-                                .glyph_y = gy,
-                                .glyph_w = gw,
-                                .glyph_h = gh,
-                                .uv_left = uv.u0,
-                                .uv_top = uv.v0,
-                                .uv_right = uv.u1,
-                                .uv_bottom = uv.v1,
-                                .r = fg_color[0],
-                                .g = fg_color[1],
-                                .b = fg_color[2],
-                            };
-                            fg_cell_count += 1;
+                        // Wide characters (emoji) span 2 cells; narrow = 1 cell.
+                        // Composed RI pairs also span 2 cells.
+                        const grid_width: f32 = if (sc.wide == .wide or composed_ri_pair) 2.0 else 1.0;
+                        if (ch.is_color) {
+                            // Color emoji — route to separate color cell buffer.
+                            // Scale the emoji bitmap to fit within grid_width cells, preserving aspect ratio.
+                            const emoji_w = @as(f32, @floatFromInt(ch.size_x));
+                            const emoji_h = @as(f32, @floatFromInt(ch.size_y));
+                            const target_w = cell_width * grid_width;
+                            const scale = @min(target_w / emoji_w, cell_height / emoji_h);
+                            const gw = emoji_w * scale;
+                            const gh = emoji_h * scale;
+                            // Center within the grid_width cells
+                            const gx = (target_w - gw) / 2.0;
+                            const gy = (cell_height - gh) / 2.0;
+                            const uv = glyphUV(ch.region, color_atlas_size);
+                            if (color_fg_cell_count < MAX_CELLS) {
+                                color_fg_cells[color_fg_cell_count] = .{
+                                    .grid_col = col_f,
+                                    .grid_row = row_f,
+                                    .glyph_x = gx,
+                                    .glyph_y = gy,
+                                    .glyph_w = gw,
+                                    .glyph_h = gh,
+                                    .uv_left = uv.u0,
+                                    .uv_top = uv.v0,
+                                    .uv_right = uv.u1,
+                                    .uv_bottom = uv.v1,
+                                    .r = fg_color[0],
+                                    .g = fg_color[1],
+                                    .b = fg_color[2],
+                                };
+                                color_fg_cell_count += 1;
+                            }
+                        } else {
+                            // Grayscale text glyph
+                            const uv = glyphUV(ch.region, atlas_size);
+                            const gx = @as(f32, @floatFromInt(ch.bearing_x));
+                            const gy = cell_baseline - @as(f32, @floatFromInt(@as(i32, @intCast(ch.size_y)) - ch.bearing_y));
+                            const gw = @as(f32, @floatFromInt(ch.size_x));
+                            const gh = @as(f32, @floatFromInt(ch.size_y));
+                            if (fg_cell_count < MAX_CELLS) {
+                                fg_cells[fg_cell_count] = .{
+                                    .grid_col = col_f,
+                                    .grid_row = row_f,
+                                    .glyph_x = gx,
+                                    .glyph_y = gy,
+                                    .glyph_w = gw,
+                                    .glyph_h = gh,
+                                    .uv_left = uv.u0,
+                                    .uv_top = uv.v0,
+                                    .uv_right = uv.u1,
+                                    .uv_bottom = uv.v1,
+                                    .r = fg_color[0],
+                                    .g = fg_color[1],
+                                    .b = fg_color[2],
+                                };
+                                fg_cell_count += 1;
+                            }
                         }
                     }
                 }
@@ -2202,6 +2663,31 @@ fn drawCells(window_height: f32, offset_x: f32, offset_y: f32) void {
         gl.BindBuffer.?(c.GL_ARRAY_BUFFER, fg_instance_vbo);
         gl.BufferSubData.?(c.GL_ARRAY_BUFFER, 0, @intCast(@sizeOf(CellFg) * fg_cell_count), &fg_cells);
         gl.DrawArraysInstanced.?(c.GL_TRIANGLE_STRIP, 0, 4, @intCast(fg_cell_count)); g_draw_call_count += 1;
+    }
+
+    // --- Draw color emoji cells ---
+    // Color emoji use premultiplied alpha, so we switch blend mode to (ONE, ONE_MINUS_SRC_ALPHA)
+    // for this pass, then restore the normal blend mode afterwards.
+    if (color_fg_cell_count > 0 and color_fg_shader != 0) {
+        gl.BlendFunc.?(c.GL_ONE, c.GL_ONE_MINUS_SRC_ALPHA);
+
+        gl.UseProgram.?(color_fg_shader);
+        gl.Uniform2f.?(gl.GetUniformLocation.?(color_fg_shader, "cellSize"), cell_width, cell_height);
+        gl.Uniform2f.?(gl.GetUniformLocation.?(color_fg_shader, "gridOffset"), offset_x, offset_y);
+        gl.Uniform1f.?(gl.GetUniformLocation.?(color_fg_shader, "windowHeight"), window_height);
+        setProjectionForProgram(color_fg_shader, window_height);
+
+        gl.ActiveTexture.?(c.GL_TEXTURE0);
+        gl.BindTexture.?(c.GL_TEXTURE_2D, g_color_atlas_texture);
+        gl.Uniform1i.?(gl.GetUniformLocation.?(color_fg_shader, "atlas"), 0);
+
+        gl.BindVertexArray.?(color_fg_vao);
+        gl.BindBuffer.?(c.GL_ARRAY_BUFFER, color_fg_instance_vbo);
+        gl.BufferSubData.?(c.GL_ARRAY_BUFFER, 0, @intCast(@sizeOf(CellFg) * color_fg_cell_count), &color_fg_cells);
+        gl.DrawArraysInstanced.?(c.GL_TRIANGLE_STRIP, 0, 4, @intCast(color_fg_cell_count)); g_draw_call_count += 1;
+
+        // Restore normal blend mode for subsequent draws (cursor, titlebar, etc.)
+        gl.BlendFunc.?(c.GL_SRC_ALPHA, c.GL_ONE_MINUS_SRC_ALPHA);
     }
 
     // --- Cursor overlay from cached state ---
@@ -2773,8 +3259,10 @@ fn updateCursorBlink() void {
 fn clearGlyphCache(allocator: std.mem.Allocator) void {
     glyph_cache.deinit(allocator);
     glyph_cache = .empty;
+    grapheme_cache.deinit(allocator);
+    grapheme_cache = .empty;
 
-    // Reset atlas — destroy GPU texture and CPU data, recreate fresh
+    // Reset grayscale atlas — destroy GPU texture and CPU data, recreate fresh
     if (g_atlas) |*a| {
         a.deinit(allocator);
         g_atlas = null;
@@ -2783,6 +3271,17 @@ fn clearGlyphCache(allocator: std.mem.Allocator) void {
         gl.DeleteTextures.?(1, &g_atlas_texture);
         g_atlas_texture = 0;
         g_atlas_modified = 0;
+    }
+
+    // Reset color atlas (BGRA emoji)
+    if (g_color_atlas) |*a| {
+        a.deinit(allocator);
+        g_color_atlas = null;
+    }
+    if (g_color_atlas_texture != 0) {
+        gl.DeleteTextures.?(1, &g_color_atlas_texture);
+        g_color_atlas_texture = 0;
+        g_color_atlas_modified = 0;
     }
 }
 
@@ -2794,6 +3293,23 @@ fn clearFallbackFaces(allocator: std.mem.Allocator) void {
     }
     g_fallback_faces.deinit(allocator);
     g_fallback_faces = .empty;
+
+    // Clean up HarfBuzz fallback fonts
+    var hb_it = g_hb_fallback_fonts.iterator();
+    while (hb_it.next()) |entry| {
+        entry.value_ptr.destroy();
+    }
+    g_hb_fallback_fonts.deinit(allocator);
+    g_hb_fallback_fonts = .empty;
+
+    if (g_hb_font) |*hf| {
+        hf.destroy();
+        g_hb_font = null;
+    }
+    if (g_hb_buf) |*hb| {
+        hb.destroy();
+        g_hb_buf = null;
+    }
 }
 
 /// Try to load a font face from config, returning the face or null on failure.
@@ -2880,6 +3396,7 @@ fn onWin32Resize(width: i32, height: i32) void {
 
         // Sync atlas if needed
         if (g_atlas != null) syncAtlasTexture(&g_atlas, &g_atlas_texture, &g_atlas_modified);
+        if (g_color_atlas != null) syncAtlasTexture(&g_color_atlas, &g_color_atlas_texture, &g_color_atlas_modified);
         if (g_icon_atlas != null) syncAtlasTexture(&g_icon_atlas, &g_icon_atlas_texture, &g_icon_atlas_modified);
         if (g_titlebar_atlas != null) syncAtlasTexture(&g_titlebar_atlas, &g_titlebar_atlas_texture, &g_titlebar_atlas_modified);
 
@@ -3998,10 +4515,13 @@ pub fn main() !void {
         // Clean up instanced rendering resources
         if (bg_shader != 0) gl.DeleteProgram.?(bg_shader);
         if (fg_shader != 0) gl.DeleteProgram.?(fg_shader);
+        if (color_fg_shader != 0) gl.DeleteProgram.?(color_fg_shader);
         if (bg_vao != 0) gl.DeleteVertexArrays.?(1, &bg_vao);
         if (fg_vao != 0) gl.DeleteVertexArrays.?(1, &fg_vao);
+        if (color_fg_vao != 0) gl.DeleteVertexArrays.?(1, &color_fg_vao);
         if (bg_instance_vbo != 0) gl.DeleteBuffers.?(1, &bg_instance_vbo);
         if (fg_instance_vbo != 0) gl.DeleteBuffers.?(1, &fg_instance_vbo);
+        if (color_fg_instance_vbo != 0) gl.DeleteBuffers.?(1, &color_fg_instance_vbo);
         if (quad_vbo != 0) gl.DeleteBuffers.?(1, &quad_vbo);
     }
 
@@ -4113,6 +4633,7 @@ pub fn main() !void {
 
         // Sync atlas textures to GPU if modified
         if (g_atlas != null) syncAtlasTexture(&g_atlas, &g_atlas_texture, &g_atlas_modified);
+        if (g_color_atlas != null) syncAtlasTexture(&g_color_atlas, &g_color_atlas_texture, &g_color_atlas_modified);
         if (g_icon_atlas != null) syncAtlasTexture(&g_icon_atlas, &g_icon_atlas_texture, &g_icon_atlas_modified);
         if (g_titlebar_atlas != null) syncAtlasTexture(&g_titlebar_atlas, &g_titlebar_atlas_texture, &g_titlebar_atlas_modified);
 

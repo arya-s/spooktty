@@ -252,6 +252,14 @@ pub const KEY_PRESSED: i16 = @bitCast(@as(u16, 0x8000));
 // Win32 API imports
 // ============================================================================
 
+extern "user32" fn LoadImageW(
+    hInst: ?HINSTANCE,
+    name: usize, // MAKEINTRESOURCE returns a usize
+    type: UINT,
+    cx: INT,
+    cy: INT,
+    fuLoad: UINT,
+) callconv(.winapi) ?HICON;
 extern "user32" fn RegisterClassExW(lpWndClass: *const WNDCLASSEXW) callconv(.winapi) ATOM;
 extern "user32" fn CreateWindowExW(
     dwExStyle: DWORD,
@@ -503,12 +511,21 @@ pub const Window = struct {
         };
         _ = RegisterClassExW(&dummy_wc);
 
+        // Load application icon from embedded resource (resource ID 1, set in phantty.rc).
+        // MAKEINTRESOURCE(1) = 1, IMAGE_ICON = 1, LR_SHARED = 0x8000
+        const IMAGE_ICON: UINT = 1;
+        const LR_SHARED: UINT = 0x8000;
+        const icon_big = LoadImageW(hInstance, 1, IMAGE_ICON, 0, 0, LR_SHARED);
+        const icon_small = LoadImageW(hInstance, 1, IMAGE_ICON, 16, 16, 0);
+
         const real_wc = WNDCLASSEXW{
             .style = CS_HREDRAW | CS_VREDRAW | CS_OWNDC | CS_DBLCLKS,
             .lpfnWndProc = wndProc,
             .hInstance = hInstance,
+            .hIcon = icon_big,
             .hCursor = LoadCursorW(null, IDC_ARROW),
             .lpszClassName = real_class,
+            .hIconSm = icon_small,
         };
         if (RegisterClassExW(&real_wc) == 0) {
             // May already be registered from a previous call — that's OK

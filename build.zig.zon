@@ -27,5 +27,6 @@
         .zlib = .{ .path = "pkg/zlib" },
         .libpng = .{ .path = "pkg/libpng" },
         .@"apple-sdk" = .{ .path = "pkg/apple-sdk" },
+        .harfbuzz = .{ .path = "pkg/harfbuzz" },
     },
 }
