@@ -2641,6 +2641,74 @@ fn loadFontFromConfig(
 }
 
 /// Resize the window to fit the current terminal grid and cell dimensions.
+/// Called from WM_SIZE inside the Win32 modal resize loop.
+/// Performs a full render cycle: resize terminal → snapshot → rebuild → draw.
+/// This runs synchronously on the main thread (which owns the GL context)
+/// while Win32's modal drag loop is active.
+fn onWin32Resize(width: i32, height: i32) void {
+    if (width <= 0 or height <= 0) return;
+    const allocator = g_allocator orelse return;
+
+    const padding: f32 = 10;
+    const tb: f32 = @floatFromInt(win32_backend.TITLEBAR_HEIGHT);
+    const content_w = @as(f32, @floatFromInt(width)) - padding * 2;
+    const content_h = @as(f32, @floatFromInt(height)) - padding - (padding + tb);
+    if (content_w <= 0 or content_h <= 0) return;
+
+    const new_cols: u16 = @intFromFloat(@max(1, content_w / cell_width));
+    const new_rows: u16 = @intFromFloat(@max(1, content_h / cell_height));
+
+    // Resize terminal + PTY if grid dimensions changed
+    if (new_cols != term_cols or new_rows != term_rows) {
+        term_cols = new_cols;
+        term_rows = new_rows;
+        // Clear any pending coalesced resize — we're handling it now
+        g_pending_resize = false;
+
+        for (0..g_tab_count) |ti| {
+            if (g_tabs[ti]) |tab| {
+                tab.surface.render_state.mutex.lock();
+                tab.surface.terminal.resize(allocator, term_cols, term_rows) catch {};
+                tab.surface.render_state.mutex.unlock();
+                tab.surface.pty.resize(term_cols, term_rows);
+            }
+        }
+    }
+
+    // Snapshot + rebuild + draw
+    if (activeSurface()) |surface| {
+        var needs_rebuild: bool = false;
+        {
+            surface.render_state.mutex.lock();
+            defer surface.render_state.mutex.unlock();
+            g_force_rebuild = true;
+            needs_rebuild = updateTerminalCells(&surface.terminal);
+        }
+        if (needs_rebuild) rebuildCells();
+
+        // Sync atlas if needed
+        if (g_atlas != null) syncAtlasTexture(&g_atlas, &g_atlas_texture, &g_atlas_modified);
+        if (g_icon_atlas != null) syncAtlasTexture(&g_icon_atlas, &g_icon_atlas_texture, &g_icon_atlas_modified);
+        if (g_titlebar_atlas != null) syncAtlasTexture(&g_titlebar_atlas, &g_titlebar_atlas_texture, &g_titlebar_atlas_modified);
+
+        gl.Viewport.?(0, 0, width, height);
+        setProjection(@floatFromInt(width), @floatFromInt(height));
+        gl.ClearColor.?(g_theme.background[0], g_theme.background[1], g_theme.background[2], 1.0);
+        gl.Clear.?(c.GL_COLOR_BUFFER_BIT);
+        renderTitlebar(@floatFromInt(width), @floatFromInt(height), tb);
+        drawCells(@floatFromInt(height), padding, padding + tb);
+        renderDebugOverlay(@floatFromInt(width));
+    } else {
+        gl.Viewport.?(0, 0, width, height);
+        setProjection(@floatFromInt(width), @floatFromInt(height));
+        gl.ClearColor.?(g_theme.background[0], g_theme.background[1], g_theme.background[2], 1.0);
+        gl.Clear.?(c.GL_COLOR_BUFFER_BIT);
+        renderTitlebar(@floatFromInt(width), @floatFromInt(height), tb);
+    }
+
+    if (g_window) |w| w.swapBuffers();
+}
+
 fn resizeWindowToGrid() void {
     const padding: f32 = 10;
     const tb: f32 = @floatFromInt(win32_backend.TITLEBAR_HEIGHT);
@@ -3684,6 +3752,11 @@ pub fn main() !void {
 
     gl.Enable.?(c.GL_BLEND);
     gl.BlendFunc.?(c.GL_SRC_ALPHA, c.GL_ONE_MINUS_SRC_ALPHA);
+
+    // Register resize callback so newly exposed pixels get filled with the
+    // terminal background during live resize (Win32 modal resize loop blocks
+    // our main loop, so we must render from inside WM_SIZE).
+    win32_window.on_resize = &onWin32Resize;
 
     std.debug.print("Ready! Cell size: {d:.1}x{d:.1}\n", .{ cell_width, cell_height });
 

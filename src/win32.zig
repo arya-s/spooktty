@@ -475,6 +475,12 @@ pub const Window = struct {
     mouse_wheel_events: RingBuffer(MouseWheelEvent, 16) = .{},
     size_changed: bool = false, // set by WM_SIZE, cleared after processing
 
+    /// Optional callback invoked from WM_SIZE so the application can
+    /// do a GL clear+swap during the Win32 modal resize loop. Without
+    /// this, newly exposed pixels show as black until the main loop
+    /// renders the next frame.
+    on_resize: ?*const fn (width: i32, height: i32) void = null,
+
     /// Initialize a Win32 window with an OpenGL 3.3 core profile context.
     ///
     /// Modern OpenGL on Win32 requires a two-step bootstrap:
@@ -854,6 +860,10 @@ fn wndProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.wina
             w.width = width;
             w.height = height;
             w.size_changed = true;
+            // Render a frame immediately so newly exposed pixels show
+            // the terminal background instead of black. This runs inside
+            // the Win32 modal resize loop where our main loop is blocked.
+            if (w.on_resize) |cb| cb(width, height);
             return 0;
         },
         WM_ACTIVATE => {
