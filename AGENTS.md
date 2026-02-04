@@ -9,12 +9,11 @@ This is a **Windows-only** project. It cross-compiles from Linux targeting `x86_
 ## Build Commands
 
 ```bash
-make debug     # Default — use this. Debug build with console subsystem.
-make release   # Release build. Do NOT use this as an agent — humans only.
+make release   # Default — always use this for builds.
 make clean     # Remove zig-out/ and .zig-cache/
 ```
 
-**Always use `make debug`** for development and testing. The `release` build uses `ReleaseFast` optimization and the Windows GUI subsystem (no console window), which strips debug output. Only a human should invoke `make release` when they're ready to ship.
+**Always use `make release`** for all builds. This produces a `ReleaseFast` optimized binary with the Windows GUI subsystem (no background console window).
 
 ## Project Structure
 

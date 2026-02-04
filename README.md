@@ -1,5 +1,9 @@
 # Phantty
 
+<p align="center">
+  <img src="assets/phantty.png" alt="Phantty logo" width="128">
+</p>
+
 A Windows terminal emulator written in Zig, powered by [libghostty-vt](https://github.com/ghostty-org/ghostty) for terminal emulation.
 
 > [!NOTE]

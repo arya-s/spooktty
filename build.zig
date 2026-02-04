@@ -59,6 +59,12 @@ pub fn build(b: *std.Build) void {
     // Link OpenGL on Windows
     exe_mod.linkSystemLibrary("opengl32", .{});
 
+    // Embed application icon via Windows resource file
+    exe_mod.addWin32ResourceFile(.{
+        .file = b.path("assets/phantty.rc"),
+        .include_paths = &.{b.path("assets")},
+    });
+
     const exe = b.addExecutable(.{
         .name = "phantty",
         .root_module = exe_mod,
