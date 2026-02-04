@@ -105,6 +105,23 @@ var g_click_x: f64 = 0; // X position of initial click (for threshold calculatio
 var g_click_y: f64 = 0; // Y position of initial click
 
 // ============================================================================
+// Scrollbar — macOS-style overlay scrollbar with fade
+// ============================================================================
+
+const SCROLLBAR_WIDTH: f32 = 12; // Width of the scrollbar track
+const SCROLLBAR_MARGIN: f32 = 2; // Margin from right edge
+const SCROLLBAR_MIN_THUMB: f32 = 20; // Minimum thumb height in pixels
+const SCROLLBAR_FADE_DELAY_MS: i64 = 800; // ms to wait before fading
+const SCROLLBAR_FADE_DURATION_MS: i64 = 400; // ms for fade-out animation
+const SCROLLBAR_HOVER_WIDTH: f32 = 12; // Wider hit area for hover/drag
+
+// Per-surface scrollbar opacity/timing lives in Surface.zig.
+// These are global interaction state (only one mouse):
+var g_scrollbar_hover: bool = false; // Mouse is over scrollbar area
+var g_scrollbar_dragging: bool = false; // Currently dragging the thumb
+var g_scrollbar_drag_offset: f32 = 0; // Offset within thumb where drag started
+
+// ============================================================================
 // Tab model — each tab owns a Surface (PTY + terminal + OSC state)
 // ============================================================================
 
@@ -2477,6 +2494,10 @@ fn renderFrameWithPostFromCells(width: c_int, height: c_int, padding: f32) void 
 }
 
 fn renderQuad(x: f32, y: f32, w: f32, h: f32, color: [3]f32) void {
+    renderQuadAlpha(x, y, w, h, color, 1.0);
+}
+
+fn renderQuadAlpha(x: f32, y: f32, w: f32, h: f32, color: [3]f32, alpha: f32) void {
     const vertices = [6][4]f32{
         .{ x, y + h, 0.0, 0.0 },
         .{ x, y, 0.0, 1.0 },
@@ -2486,7 +2507,19 @@ fn renderQuad(x: f32, y: f32, w: f32, h: f32, color: [3]f32) void {
         .{ x + w, y + h, 1.0, 0.0 },
     };
 
-    gl.Uniform3f.?(gl.GetUniformLocation.?(shader_program, "textColor"), color[0], color[1], color[2]);
+    // Pre-multiply alpha into color and use the solid texture (which has alpha=1).
+    // With GL_SRC_ALPHA blending, we set textColor to full RGB and modulate alpha
+    // via the vec4 output. Since our fragment shader does:
+    //   color = vec4(textColor, 1.0) * sampled
+    // and sampled = vec4(1,1,1, texture.r) with solid_texture.r = 1,
+    // the output alpha is always 1. To get transparency we use a small trick:
+    // temporarily blend manually by dimming the color toward the background.
+    // This avoids needing a shader change.
+    const r = color[0] * alpha + g_theme.background[0] * (1 - alpha);
+    const g = color[1] * alpha + g_theme.background[1] * (1 - alpha);
+    const b = color[2] * alpha + g_theme.background[2] * (1 - alpha);
+
+    gl.Uniform3f.?(gl.GetUniformLocation.?(shader_program, "textColor"), r, g, b);
     gl.BindTexture.?(c.GL_TEXTURE_2D, solid_texture);
     gl.BindBuffer.?(c.GL_ARRAY_BUFFER, vbo);
     gl.BufferSubData.?(c.GL_ARRAY_BUFFER, 0, @sizeOf(@TypeOf(vertices)), &vertices);
@@ -2507,6 +2540,167 @@ fn updateFps() void {
         g_fps_value = @as(f32, @floatFromInt(g_fps_frame_count)) * 1000.0 / @as(f32, @floatFromInt(elapsed));
         g_fps_frame_count = 0;
         g_fps_last_time = now;
+    }
+}
+
+// ============================================================================
+// Scrollbar — macOS-style overlay with fade
+// ============================================================================
+
+/// Compute scrollbar geometry from terminal state.
+/// Returns null if there's no scrollback (nothing to scroll).
+fn scrollbarGeometry(window_height: f32, top_padding: f32) ?struct {
+    track_x: f32,
+    track_y: f32, // bottom of track (GL coords, y=0 is bottom)
+    track_h: f32,
+    thumb_y: f32,
+    thumb_h: f32,
+} {
+    const surface = activeSurface() orelse return null;
+    const sb = surface.terminal.screens.active.pages.scrollbar();
+    if (sb.total <= sb.len) return null; // No scrollback, no scrollbar
+
+    const padding: f32 = 10;
+    const track_x = window_height; // We'll compute from window width — passed separately
+    _ = track_x;
+
+    // Track spans the terminal content area (below titlebar, above bottom padding)
+    const track_top = window_height - top_padding; // top of terminal area in GL coords
+    const track_bottom = padding; // bottom padding
+    const track_h = track_top - track_bottom;
+    if (track_h <= 0) return null;
+
+    // Thumb proportional to visible / total
+    const ratio = @as(f32, @floatFromInt(sb.len)) / @as(f32, @floatFromInt(sb.total));
+    const thumb_h = @max(SCROLLBAR_MIN_THUMB, track_h * ratio);
+
+    // Thumb position: offset=0 means top, offset=total-len means bottom
+    const max_offset = @as(f32, @floatFromInt(sb.total - sb.len));
+    const scroll_frac = if (max_offset > 0)
+        @as(f32, @floatFromInt(sb.offset)) / max_offset
+    else
+        0;
+    // In GL coords: top of track is higher y value
+    const thumb_top = track_top - scroll_frac * (track_h - thumb_h);
+    const thumb_y = thumb_top - thumb_h;
+
+    return .{
+        .track_x = 0, // placeholder — caller provides window_width
+        .track_y = track_bottom,
+        .track_h = track_h,
+        .thumb_y = thumb_y,
+        .thumb_h = thumb_h,
+    };
+}
+
+/// Show the scrollbar on the active surface (reset fade timer).
+fn scrollbarShow() void {
+    const surface = activeSurface() orelse return;
+    surface.scrollbar_opacity = 1.0;
+    surface.scrollbar_show_time = std.time.milliTimestamp();
+}
+
+/// Update scrollbar fade animation for a surface. Call once per frame.
+fn scrollbarUpdateFade(surface: *Surface) void {
+    if (g_scrollbar_hover or g_scrollbar_dragging) {
+        surface.scrollbar_opacity = 1.0;
+        return;
+    }
+    if (surface.scrollbar_opacity <= 0) return;
+
+    const now = std.time.milliTimestamp();
+    const elapsed = now - surface.scrollbar_show_time;
+
+    if (elapsed < SCROLLBAR_FADE_DELAY_MS) {
+        surface.scrollbar_opacity = 1.0;
+    } else {
+        const fade_elapsed = elapsed - SCROLLBAR_FADE_DELAY_MS;
+        if (fade_elapsed >= SCROLLBAR_FADE_DURATION_MS) {
+            surface.scrollbar_opacity = 0;
+        } else {
+            surface.scrollbar_opacity = 1.0 - @as(f32, @floatFromInt(fade_elapsed)) / @as(f32, @floatFromInt(SCROLLBAR_FADE_DURATION_MS));
+        }
+    }
+}
+
+/// Render the scrollbar overlay.
+fn renderScrollbar(window_width: f32, window_height: f32, top_padding: f32) void {
+    const surface = activeSurface() orelse return;
+    scrollbarUpdateFade(surface);
+    if (surface.scrollbar_opacity <= 0.01) return;
+
+    const geo = scrollbarGeometry(window_height, top_padding) orelse return;
+
+    const bar_x = window_width - SCROLLBAR_WIDTH - SCROLLBAR_MARGIN;
+    const bar_w = SCROLLBAR_WIDTH;
+
+    // Use the shader_program for quad rendering
+    gl.UseProgram.?(shader_program);
+    gl.BindVertexArray.?(vao);
+
+    const fade = surface.scrollbar_opacity;
+
+    // Track background: black at low alpha to subtly lift it from the terminal bg
+    const track_alpha = fade * 0.08;
+    renderQuadAlpha(bar_x, geo.track_y, bar_w, geo.track_h, .{ 0, 0, 0 }, track_alpha);
+
+    // Thumb: black at 24% opacity
+    const thumb_alpha = fade * 0.24;
+    renderQuadAlpha(bar_x, geo.thumb_y, bar_w, geo.thumb_h, .{ 0, 0, 0 }, thumb_alpha);
+}
+
+/// Check if a point (in client pixel coords, origin top-left) is over the scrollbar.
+fn scrollbarHitTest(xpos: f64, ypos: f64, window_width: f32, window_height: f32, top_padding: f32) bool {
+    const bar_right = window_width;
+    const bar_left = window_width - SCROLLBAR_HOVER_WIDTH - SCROLLBAR_MARGIN;
+    const padding: f32 = 10;
+    const track_top_px = top_padding; // in pixel coords (top-left origin)
+    const track_bottom_px = window_height - padding;
+
+    return @as(f32, @floatCast(xpos)) >= bar_left and
+        @as(f32, @floatCast(xpos)) <= bar_right and
+        @as(f32, @floatCast(ypos)) >= track_top_px and
+        @as(f32, @floatCast(ypos)) <= track_bottom_px;
+}
+
+/// Check if a point is over the scrollbar thumb specifically.
+fn scrollbarThumbHitTest(ypos: f64, window_height: f32, top_padding: f32) bool {
+    const geo = scrollbarGeometry(window_height, top_padding) orelse return false;
+    // Convert ypos (top-left origin) to GL coords (bottom-left origin)
+    const gl_y = window_height - @as(f32, @floatCast(ypos));
+    return gl_y >= geo.thumb_y and gl_y <= geo.thumb_y + geo.thumb_h;
+}
+
+/// Handle scrollbar drag: convert pixel y to scroll position.
+fn scrollbarDrag(ypos: f64, window_height: f32, top_padding: f32) void {
+    const surface = activeSurface() orelse return;
+    const sb = surface.terminal.screens.active.pages.scrollbar();
+    if (sb.total <= sb.len) return;
+
+    const padding: f32 = 10;
+    const track_top_px = top_padding;
+    const track_bottom_px = window_height - padding;
+    const track_h = track_bottom_px - track_top_px;
+    if (track_h <= 0) return;
+
+    const ratio = @as(f32, @floatFromInt(sb.len)) / @as(f32, @floatFromInt(sb.total));
+    const thumb_h = @max(SCROLLBAR_MIN_THUMB, track_h * ratio);
+    const scrollable_h = track_h - thumb_h;
+    if (scrollable_h <= 0) return;
+
+    // ypos is in top-left coords; track_top_px is the top of the track
+    const y_in_track = @as(f32, @floatCast(ypos)) - track_top_px - g_scrollbar_drag_offset;
+    const frac = std.math.clamp(y_in_track / scrollable_h, 0, 1);
+
+    const max_offset = sb.total - sb.len;
+    const target_offset: isize = @intFromFloat(frac * @as(f32, @floatFromInt(max_offset)));
+    const current_offset: isize = @intCast(sb.offset);
+    const delta = target_offset - current_offset;
+
+    if (delta != 0) {
+        surface.render_state.mutex.lock();
+        defer surface.render_state.mutex.unlock();
+        surface.terminal.scrollViewport(.{ .delta = delta }) catch {};
     }
 }
 
@@ -2697,6 +2891,7 @@ fn onWin32Resize(width: i32, height: i32) void {
         gl.Clear.?(c.GL_COLOR_BUFFER_BIT);
         renderTitlebar(@floatFromInt(width), @floatFromInt(height), tb);
         drawCells(@floatFromInt(height), padding, padding + tb);
+        renderScrollbar(@floatFromInt(width), @floatFromInt(height), padding + tb);
         renderDebugOverlay(@floatFromInt(width));
     } else {
         gl.Viewport.?(0, 0, width, height);
@@ -3035,6 +3230,7 @@ const win32_input = struct {
                     surface.render_state.mutex.lock();
                     surface.terminal.scrollViewport(.{ .delta = -@as(isize, term_rows / 2) }) catch {};
                     surface.render_state.mutex.unlock();
+                    scrollbarShow();
                     break :blk null;
                 }
                 break :blk "\x1b[5~";
@@ -3044,6 +3240,7 @@ const win32_input = struct {
                     surface.render_state.mutex.lock();
                     surface.terminal.scrollViewport(.{ .delta = @as(isize, term_rows / 2) }) catch {};
                     surface.render_state.mutex.unlock();
+                    scrollbarShow();
                     break :blk null;
                 }
                 break :blk "\x1b[6~";
@@ -3102,6 +3299,32 @@ const win32_input = struct {
                     return;
                 }
 
+                // Check if click is on the scrollbar
+                const win = g_window orelse return;
+                const fb = win.getFramebufferSize();
+                const w_f: f32 = @floatFromInt(fb.width);
+                const h_f: f32 = @floatFromInt(fb.height);
+                const tb_f: f32 = @floatFromInt(win32_backend.TITLEBAR_HEIGHT);
+                const top_pad: f32 = 10 + tb_f;
+                const sb_opacity = if (activeSurface()) |s| s.scrollbar_opacity else 0;
+                if (sb_opacity > 0 and scrollbarHitTest(xpos, ypos, w_f, h_f, top_pad)) {
+                    g_scrollbar_dragging = true;
+                    scrollbarShow();
+                    // Calculate drag offset within thumb
+                    if (scrollbarThumbHitTest(ypos, h_f, top_pad)) {
+                        // Clicked on thumb — offset from top of thumb
+                        const geo = scrollbarGeometry(h_f, top_pad) orelse return;
+                        const thumb_top_px = h_f - (geo.thumb_y + geo.thumb_h); // convert GL→pixel
+                        g_scrollbar_drag_offset = @as(f32, @floatCast(ypos)) - thumb_top_px;
+                    } else {
+                        // Clicked on track — jump thumb center to click position
+                        const geo = scrollbarGeometry(h_f, top_pad) orelse return;
+                        g_scrollbar_drag_offset = geo.thumb_h / 2;
+                        scrollbarDrag(ypos, h_f, top_pad);
+                    }
+                    return;
+                }
+
                 const cell_pos = mouseToCell(xpos, ypos);
                 activeSelection().start_col = cell_pos.col;
                 activeSelection().start_row = cell_pos.row;
@@ -3113,6 +3336,8 @@ const win32_input = struct {
                 g_click_y = ypos;
             } else {
                 // Mouse up
+                g_scrollbar_dragging = false;
+
                 if (plus_btn_pressed) {
                     plus_btn_pressed = false;
                     // Only fire if still in the + button area
@@ -3212,10 +3437,33 @@ const win32_input = struct {
     }
 
     fn handleMouseMove(ev: win32_backend.MouseMoveEvent) void {
-        if (!g_selecting) return;
-
         const xpos: f64 = @floatFromInt(ev.x);
         const ypos: f64 = @floatFromInt(ev.y);
+
+        // Update scrollbar hover state
+        const win = g_window orelse return;
+        const fb = win.getFramebufferSize();
+        const w_f: f32 = @floatFromInt(fb.width);
+        const h_f: f32 = @floatFromInt(fb.height);
+        const tb_f: f32 = @floatFromInt(win32_backend.TITLEBAR_HEIGHT);
+        const top_pad: f32 = 10 + tb_f;
+
+        const was_hover = g_scrollbar_hover;
+        g_scrollbar_hover = scrollbarHitTest(xpos, ypos, w_f, h_f, top_pad);
+        const sb_opacity2 = if (activeSurface()) |s| s.scrollbar_opacity else 0;
+        if (g_scrollbar_hover and !was_hover and sb_opacity2 > 0) {
+            scrollbarShow(); // Reset fade timer when entering scrollbar area
+        }
+
+        // Handle scrollbar drag
+        if (g_scrollbar_dragging) {
+            scrollbarDrag(ypos, h_f, top_pad);
+            return;
+        }
+
+        // Normal selection handling
+        if (!g_selecting) return;
+
         const cell_pos = mouseToCell(xpos, ypos);
         activeSelection().end_col = cell_pos.col;
         activeSelection().end_row = cell_pos.row;
@@ -3244,6 +3492,7 @@ const win32_input = struct {
             const delta: isize = @intFromFloat(-notches * 3);
             surface.terminal.scrollViewport(.{ .delta = delta }) catch {};
         }
+        scrollbarShow();
     }
 
     // --- Clipboard (Win32 native) ---
@@ -3872,6 +4121,8 @@ pub fn main() !void {
                 renderTitlebar(@floatFromInt(fb_width), @floatFromInt(fb_height), titlebar_offset);
 
                 drawCells(@floatFromInt(fb_height), padding, top_padding);
+
+                renderScrollbar(@floatFromInt(fb_width), @floatFromInt(fb_height), top_padding);
             }
         } else if (!g_post_enabled) {
             gl.Viewport.?(0, 0, fb_width, fb_height);

@@ -927,19 +927,20 @@ fn wndProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.wina
             const titlebar_h = w.titlebar_height;
 
             // Resize borders (top, left, right, bottom, corners)
+            const right_border: i32 = 3; // Thin right border to avoid scrollbar conflict
             if (IsZoomed(hwnd) == 0) { // not maximized
                 if (pt.y < border) {
                     if (pt.x < border) return HTTOPLEFT;
-                    if (pt.x >= client_rect.right - border) return HTTOPRIGHT;
+                    if (pt.x >= client_rect.right - right_border) return HTTOPRIGHT;
                     return HTTOP;
                 }
                 if (pt.y >= client_rect.bottom - border) {
                     if (pt.x < border) return HTBOTTOMLEFT;
-                    if (pt.x >= client_rect.right - border) return HTBOTTOMRIGHT;
+                    if (pt.x >= client_rect.right - right_border) return HTBOTTOMRIGHT;
                     return HTBOTTOM;
                 }
                 if (pt.x < border) return HTLEFT;
-                if (pt.x >= client_rect.right - border) return HTRIGHT;
+                if (pt.x >= client_rect.right - right_border) return HTRIGHT;
             }
 
             // Title bar area

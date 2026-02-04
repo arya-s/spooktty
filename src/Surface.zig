@@ -59,6 +59,13 @@ dirty: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
 /// Set when the PTY process has exited.
 exited: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
+// ============================================================================
+// Scrollbar state (per-surface, macOS-style overlay with fade)
+// ============================================================================
+
+scrollbar_opacity: f32 = 0,
+scrollbar_show_time: i64 = 0,
+
 
 
 /// IO thread handle (null until Phase 2).
