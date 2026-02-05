@@ -123,6 +123,16 @@ var g_scrollbar_dragging: bool = false; // Currently dragging the thumb
 var g_scrollbar_drag_offset: f32 = 0; // Offset within thumb where drag started
 
 // ============================================================================
+// Tab close button — fade-in on hover per tab
+// ============================================================================
+
+const TAB_CLOSE_BTN_W: f32 = 36; // width of the close button hit area
+const TAB_CLOSE_FADE_SPEED: f32 = 6.0; // opacity units per second (0→1 in ~170ms)
+var g_tab_close_opacity: [MAX_TABS]f32 = .{0} ** MAX_TABS; // per-tab close button opacity
+var g_tab_close_pressed: ?usize = null; // tab index whose close btn is pressed (mouse-down)
+var g_last_frame_time_ms: i64 = 0; // for delta-time computation
+
+// ============================================================================
 // Tab model — each tab owns a Surface (PTY + terminal + OSC state)
 // ============================================================================
 
@@ -228,12 +238,14 @@ fn closeTab(idx: usize) void {
         allocator.destroy(tab);
     }
 
-    // Shift tabs down
+    // Shift tabs and close button opacity down
     var i = idx;
     while (i + 1 < g_tab_count) : (i += 1) {
         g_tabs[i] = g_tabs[i + 1];
+        g_tab_close_opacity[i] = g_tab_close_opacity[i + 1];
     }
     g_tabs[g_tab_count - 1] = null;
+    g_tab_close_opacity[g_tab_count - 1] = 0;
     g_tab_count -= 1;
 
     // Adjust active tab index
@@ -308,6 +320,7 @@ var glyph_face: ?freetype.Face = null;
 var icon_face: ?freetype.Face = null; // Segoe MDL2 Assets for caption button icons
 var icon_cache: std.AutoHashMapUnmanaged(u32, Character) = .empty;
 
+
 // Font atlas — single texture for all glyphs (replaces per-glyph textures)
 var g_atlas: ?FontAtlas = null;
 var g_atlas_texture: c.GLuint = 0;
@@ -322,6 +335,8 @@ var g_color_atlas_modified: usize = 0;
 var g_icon_atlas: ?FontAtlas = null;
 var g_icon_atlas_texture: c.GLuint = 0;
 var g_icon_atlas_modified: usize = 0;
+
+
 
 // Titlebar font — separate face/cache/atlas at fixed 14pt for crisp titlebar text.
 // Avoids scaling artifacts from rendering terminal-size glyphs at a smaller size.
@@ -1859,20 +1874,39 @@ fn renderTitlebar(window_width: f32, window_height: f32, titlebar_h: f32) void {
     var cursor_x: f32 = 0;
     const bdr: f32 = 1; // border thickness
 
+    // --- Update close button fade animation (delta-time based) ---
+    const now_ms = std.time.milliTimestamp();
+    const dt: f32 = if (g_last_frame_time_ms > 0)
+        @as(f32, @floatFromInt(now_ms - g_last_frame_time_ms)) / 1000.0
+    else
+        0.016; // ~60fps default on first frame
+    g_last_frame_time_ms = now_ms;
+
     for (0..num_tabs) |tab_idx| {
         const is_active = (tab_idx == g_active_tab);
+
+        // Check if mouse is hovering this tab
+        const tab_hovered = blk: {
+            const win = g_window orelse break :blk false;
+            if (win.mouse_y < 0 or win.mouse_y >= @as(i32, @intFromFloat(titlebar_h))) break :blk false;
+            const fx: f32 = @floatFromInt(win.mouse_x);
+            break :blk fx >= cursor_x and fx < cursor_x + tab_w;
+        };
+
+        // Animate close button opacity: fade in when hovered, fade out when not
+        if (num_tabs > 1) {
+            if (tab_hovered) {
+                g_tab_close_opacity[tab_idx] = @min(1.0, g_tab_close_opacity[tab_idx] + TAB_CLOSE_FADE_SPEED * dt);
+            } else {
+                g_tab_close_opacity[tab_idx] = @max(0.0, g_tab_close_opacity[tab_idx] - TAB_CLOSE_FADE_SPEED * dt);
+            }
+        } else {
+            g_tab_close_opacity[tab_idx] = 0;
+        }
 
         // Inactive tabs: slightly lighter bg with 1px darker inset border
         // Active tab: no border, same as terminal bg (merges with content)
         if (!is_active) {
-            // Check hover
-            const tab_hovered = blk: {
-                const win = g_window orelse break :blk false;
-                if (win.mouse_y < 0 or win.mouse_y >= @as(i32, @intFromFloat(titlebar_h))) break :blk false;
-                const fx: f32 = @floatFromInt(win.mouse_x);
-                break :blk fx >= cursor_x and fx < cursor_x + tab_w;
-            };
-
             // Fill — slightly lighter on hover
             const tab_bg = if (tab_hovered) [3]f32{
                 @min(1.0, inactive_tab_bg[0] + 0.04),
@@ -1888,34 +1922,16 @@ fn renderTitlebar(window_width: f32, window_height: f32, titlebar_h: f32) void {
             }
         }
 
-        // Tab title text — rendered at native 14pt via titlebar font (no scaling)
-        // Shortcut label (^1 through ^0) rendered right-aligned, only for tabs 1–10 in multi-tab
+        // Tab content: title always centered on full tab, shortcut + close overlay on right.
+        // On hover the close button fades in and the shortcut slides left to make room.
         const title = if (g_tabs[tab_idx]) |t| t.getTitle() else "New Tab";
         if (title.len > 0) {
             const text_color = if (is_active) text_active else text_inactive;
             const shortcut_color = [3]f32{ 0.45, 0.45, 0.45 };
-            const tab_pad: f32 = 18;
-
-            // Shortcut label: "^1" through "^9", "^0" for tab 10
-            const has_shortcut = num_tabs > 1 and tab_idx < 10;
-            const shortcut_digit: u8 = if (has_shortcut)
-                (if (tab_idx == 9) '0' else @as(u8, @intCast('1' + tab_idx)))
-            else
-                0;
-
-            // Measure shortcut width
-            var shortcut_w: f32 = 0;
-            if (has_shortcut) {
-                shortcut_w += titlebarGlyphAdvance('^');
-                shortcut_w += titlebarGlyphAdvance(@intCast(shortcut_digit));
-            }
-
-            const shortcut_gap: f32 = if (has_shortcut) 6 else 0;
-            const shortcut_reserved = if (has_shortcut) shortcut_w + shortcut_gap else 0;
+            const tab_pad: f32 = 12;
 
             const center_region = if (num_tabs == 1) window_width else tab_w;
             const center_offset = if (num_tabs == 1) @as(f32, 0) else cursor_x;
-            const avail_w = center_region - tab_pad * 2 - shortcut_reserved;
 
             // Decode title into codepoints for proper UTF-8 handling
             var codepoints: [256]u32 = undefined;
@@ -1934,10 +1950,10 @@ fn renderTitlebar(window_width: f32, window_height: f32, titlebar_h: f32) void {
 
             const text_y = tb_top + (titlebar_h - g_titlebar_cell_height) / 2;
 
+            // Title: always centered on the full tab width
+            const avail_w = center_region - tab_pad * 2;
             if (text_width <= avail_w) {
-                // Fits — center it
-                const text_area = center_region - shortcut_reserved;
-                var text_x = center_offset + (text_area - text_width) / 2;
+                var text_x = center_offset + (center_region - text_width) / 2;
                 for (codepoints[0..cp_count]) |cp| {
                     renderTitlebarChar(cp, text_x, text_y, text_color);
                     text_x += titlebarGlyphAdvance(cp);
@@ -1949,7 +1965,6 @@ fn renderTitlebar(window_width: f32, window_height: f32, titlebar_h: f32) void {
                 const text_budget = avail_w - ellipsis_w;
                 const half_budget = text_budget / 2;
 
-                // Measure codepoints from start
                 var start_w: f32 = 0;
                 var start_end: usize = 0;
                 for (codepoints[0..cp_count], 0..) |cp, idx| {
@@ -1959,7 +1974,6 @@ fn renderTitlebar(window_width: f32, window_height: f32, titlebar_h: f32) void {
                     start_end = idx + 1;
                 }
 
-                // Measure codepoints from end
                 var end_w: f32 = 0;
                 var end_start: usize = cp_count;
                 var j: usize = cp_count;
@@ -1984,13 +1998,96 @@ fn renderTitlebar(window_width: f32, window_height: f32, titlebar_h: f32) void {
                 }
             }
 
-            // Render shortcut label right-aligned
+            // Right side: shortcut and close button crossfade in the same position.
+            // close_opacity (0→1) drives the animation:
+            //   0 = shortcut visible, close hidden
+            //   1 = shortcut slid down + faded out, close faded in
+            const has_shortcut = num_tabs > 1 and tab_idx < 10;
+            const close_opacity = g_tab_close_opacity[tab_idx];
+            const shortcut_opacity = 1.0 - close_opacity;
+
+            // Measure shortcut width (needed for centering both elements)
+            const shortcut_digit: u8 = if (has_shortcut)
+                (if (tab_idx == 9) '0' else @as(u8, @intCast('1' + tab_idx)))
+            else
+                0;
+            var shortcut_w: f32 = 0;
             if (has_shortcut) {
-                const sc_color = if (is_active) text_active else shortcut_color;
-                var sc_x = center_offset + center_region - tab_pad - shortcut_w;
-                renderTitlebarChar('^', sc_x, text_y, sc_color);
-                sc_x += titlebarGlyphAdvance('^');
-                renderTitlebarChar(@intCast(shortcut_digit), sc_x, text_y, sc_color);
+                shortcut_w += titlebarGlyphAdvance('^');
+                shortcut_w += titlebarGlyphAdvance(@intCast(shortcut_digit));
+            }
+
+            // Both elements are right-aligned with their right edge at the same position
+            const right_edge = center_offset + center_region - tab_pad;
+
+            // Shortcut label — fades out and slides down on hover
+            if (has_shortcut and shortcut_opacity > 0.01) {
+                const sc_x = right_edge - shortcut_w;
+                const slide_down: f32 = close_opacity * 6; // slide 6px down
+                const sc_y = text_y - slide_down;
+
+                const sc_base = if (is_active) text_active else shortcut_color;
+                const sc_faded = [3]f32{
+                    sc_base[0] * shortcut_opacity + bg[0] * close_opacity,
+                    sc_base[1] * shortcut_opacity + bg[1] * close_opacity,
+                    sc_base[2] * shortcut_opacity + bg[2] * close_opacity,
+                };
+                var sx = sc_x;
+                renderTitlebarChar('^', sx, sc_y, sc_faded);
+                sx += titlebarGlyphAdvance('^');
+                renderTitlebarChar(@intCast(shortcut_digit), sx, sc_y, sc_faded);
+            }
+
+            // Close button — fades in, centered on the shortcut's visual center
+            if (close_opacity > 0.01 and num_tabs > 1) {
+                const shortcut_center = right_edge - shortcut_w / 2;
+                const close_btn_x = shortcut_center - TAB_CLOSE_BTN_W / 2;
+                const close_hovered = blk: {
+                    if (!tab_hovered) break :blk false;
+                    const win = g_window orelse break :blk false;
+                    const fx: f32 = @floatFromInt(win.mouse_x);
+                    break :blk fx >= close_btn_x and fx < close_btn_x + TAB_CLOSE_BTN_W;
+                };
+
+                const base_close_color = [3]f32{ 0.6, 0.6, 0.6 };
+                const hover_close_color = [3]f32{ 0.95, 0.95, 0.95 };
+                const raw_color = if (close_hovered) hover_close_color else base_close_color;
+                const faded_close_color = [3]f32{
+                    raw_color[0] * close_opacity + bg[0] * shortcut_opacity,
+                    raw_color[1] * close_opacity + bg[1] * shortcut_opacity,
+                    raw_color[2] * close_opacity + bg[2] * shortcut_opacity,
+                };
+
+                // Subtle hover highlight
+                if (close_hovered) {
+                    const hover_bg = [3]f32{
+                        @min(1.0, bg[0] + 0.1),
+                        @min(1.0, bg[1] + 0.1),
+                        @min(1.0, bg[2] + 0.1),
+                    };
+                    const btn_size: f32 = 22;
+                    const bx = close_btn_x + (TAB_CLOSE_BTN_W - btn_size) / 2;
+                    const by = tb_top + (titlebar_h - btn_size) / 2;
+                    renderQuadAlpha(bx, by, btn_size, btn_size, hover_bg, close_opacity);
+                }
+
+                if (icon_face != null) {
+                    if (loadIconGlyph(0xE8BB)) |ch| {
+                        renderIconGlyph(ch, close_btn_x, tb_top, TAB_CLOSE_BTN_W, titlebar_h, faded_close_color, 1.0);
+                    }
+                } else {
+                    const cx = close_btn_x + TAB_CLOSE_BTN_W / 2;
+                    const cy = tb_top + titlebar_h / 2;
+                    const arm: f32 = 4;
+                    const t: f32 = 1.0;
+                    const steps: usize = 24;
+                    for (0..steps) |si| {
+                        const frac = @as(f32, @floatFromInt(si)) / @as(f32, @floatFromInt(steps - 1));
+                        const px = cx - arm + frac * arm * 2;
+                        renderQuad(px - t / 2, (cy + arm - frac * arm * 2) - t / 2, t, t, faded_close_color);
+                        renderQuad(px - t / 2, (cy - arm + frac * arm * 2) - t / 2, t, t, faded_close_color);
+                    }
+                }
             }
         }
 
@@ -3867,6 +3964,21 @@ const win32_input = struct {
                 // Mouse up
                 g_scrollbar_dragging = false;
 
+                // Handle close button release — close tab if still on the close button
+                if (g_tab_close_pressed) |pressed_idx| {
+                    g_tab_close_pressed = null;
+                    if (ypos < titlebar_h and pressed_idx < g_tab_count) {
+                        if (hitTestTabCloseButton(xpos, pressed_idx)) {
+                            if (g_tab_count <= 1) {
+                                g_should_close = true;
+                            } else {
+                                closeTab(pressed_idx);
+                            }
+                        }
+                    }
+                    return;
+                }
+
                 if (plus_btn_pressed) {
                     plus_btn_pressed = false;
                     // Only fire if still in the + button area
@@ -3899,10 +4011,20 @@ const win32_input = struct {
         const tab_area_w: f64 = window_width - right_reserved;
         const tab_w: f64 = if (num_tabs > 0) tab_area_w / @as(f64, @floatFromInt(num_tabs)) else tab_area_w;
 
-        // Check which tab was clicked
+        // Check which tab was clicked — also check close button
         var cursor: f64 = 0;
         for (0..num_tabs) |tab_idx| {
             if (xpos >= cursor and xpos < cursor + tab_w) {
+                // Check if the close button was clicked (centered on shortcut position)
+                if (num_tabs > 1 and g_tab_close_opacity[tab_idx] > 0.1) {
+                    const sc_w: f64 = @floatCast(titlebarGlyphAdvance('^') + titlebarGlyphAdvance(if (tab_idx == 9) @as(u32, '0') else @as(u32, @intCast('1' + tab_idx))));
+                    const sc_center = cursor + tab_w - 12 - sc_w / 2;
+                    const close_btn_x = sc_center - TAB_CLOSE_BTN_W / 2;
+                    if (xpos >= close_btn_x and xpos < close_btn_x + TAB_CLOSE_BTN_W) {
+                        g_tab_close_pressed = tab_idx;
+                        return;
+                    }
+                }
                 switchTab(tab_idx);
                 return;
             }
@@ -3942,6 +4064,32 @@ const win32_input = struct {
             cursor += tab_w;
         }
         return null;
+    }
+
+    fn hitTestTabCloseButton(xpos: f64, tab_idx: usize) bool {
+        const window_width: f64 = blk: {
+            const win = g_window orelse break :blk 800.0;
+            var rect: win32_backend.RECT = undefined;
+            _ = win32_backend.GetClientRect(win.hwnd, &rect);
+            break :blk @floatFromInt(rect.right);
+        };
+
+        const caption_area_w: f64 = 46 * 3;
+        const gap_w: f64 = 42;
+        const plus_btn_w: f64 = 46;
+        const show_plus = g_tab_count > 1;
+        const num_tabs = g_tab_count;
+
+        const plus_total: f64 = if (show_plus) plus_btn_w else 0;
+        const right_reserved: f64 = caption_area_w + gap_w + plus_total;
+        const tab_area_w: f64 = window_width - right_reserved;
+        const tab_w: f64 = if (num_tabs > 0) tab_area_w / @as(f64, @floatFromInt(num_tabs)) else tab_area_w;
+
+        const tab_x = tab_w * @as(f64, @floatFromInt(tab_idx));
+        const sc_w: f64 = @floatCast(titlebarGlyphAdvance('^') + titlebarGlyphAdvance(if (tab_idx == 9) @as(u32, '0') else @as(u32, @intCast('1' + tab_idx))));
+        const sc_center = tab_x + tab_w - 12 - sc_w / 2;
+        const close_btn_x = sc_center - TAB_CLOSE_BTN_W / 2;
+        return xpos >= close_btn_x and xpos < close_btn_x + TAB_CLOSE_BTN_W;
     }
 
     fn hitTestPlusButton(xpos: f64) bool {
@@ -4462,6 +4610,7 @@ pub fn main() !void {
             f.deinit();
             icon_face = null;
         }
+
         // Clean up the current font face (may have been replaced by hot-reload)
         if (glyph_face) |f| f.deinit();
         glyph_face = null;
@@ -4478,6 +4627,7 @@ pub fn main() !void {
             gl.DeleteTextures.?(1, &g_icon_atlas_texture);
             g_icon_atlas_texture = 0;
         }
+
         // Clean up titlebar font
         if (g_titlebar_face) |f| f.deinit();
         g_titlebar_face = null;
