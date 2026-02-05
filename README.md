@@ -1,13 +1,11 @@
-# Phantty
+<h1>
+  <p align="center">
+    <img src="assets/phantty.png" alt="Phantty logo" width="128">
+    <br>Phantty
+  </p>
+</h1>
 
-<p align="center">
-  <img src="assets/phantty.png" alt="Phantty logo" width="128">
-</p>
-
-A Windows terminal emulator written in Zig, powered by [libghostty-vt](https://github.com/ghostty-org/ghostty) for terminal emulation.
-
-> [!NOTE]
-> Phantty is **Windows-only**. On macOS and Linux, use [Ghostty](https://ghostty.org/) instead.
+A Windows terminal written in Zig, powered by [libghostty-vt](https://github.com/ghostty-org/ghostty) for terminal emulation.
 
 ## Features
 
@@ -18,6 +16,10 @@ A Windows terminal emulator written in Zig, powered by [libghostty-vt](https://g
 - **Sprite rendering** - Box drawing, block elements, braille patterns, powerline symbols
 - **Ghostty-style font metrics** - Proper ascent/descent/line_gap from hhea/OS2 tables
 - **Theme support** - Ghostty-compatible theme files (default: Poimandres)
+
+> [!NOTE]
+> Phantty is **Windows-only**. On macOS and Linux, use [Ghostty](https://ghostty.org/) instead.
+
 
 ## Building
 
