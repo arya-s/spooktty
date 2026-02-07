@@ -82,6 +82,13 @@ pub fn run(self: *AppWindow) void {
     };
 }
 
+/// Get the Win32 HWND for this window (for cross-thread communication).
+pub fn getHwnd(self: *AppWindow) ?win32_backend.HWND {
+    _ = self;
+    if (g_window) |w| return w.hwnd;
+    return null;
+}
+
 /// Clean up resources.
 pub fn deinit(self: *AppWindow) void {
     // Clean up all tabs
@@ -3893,7 +3900,8 @@ const win32_input = struct {
         // Ctrl+Shift+N = new window
         if (ev.ctrl and ev.shift and ev.vk == 0x4E) { // 'N'
             if (g_app) |app| {
-                app.requestNewWindow();
+                const hwnd = if (g_window) |w| w.hwnd else null;
+                app.requestNewWindow(hwnd);
             }
             return;
         }
@@ -4482,14 +4490,36 @@ fn runMainLoop(allocator: std.mem.Allocator) !void {
     // stays alive for the rest of main().
     // ================================================================
 
-    // --- Win32 window (restore position from last session) ---
-    const saved_state = loadWindowState(allocator);
+    // --- Win32 window (cascade from parent or restore from last session) ---
+    // Check if App has a suggested position (for cascading from parent window)
+    var init_x: ?i32 = null;
+    var init_y: ?i32 = null;
+    if (g_app) |app| {
+        app.mutex.lock();
+        if (app.next_window_x) |x| {
+            init_x = x;
+            app.next_window_x = null;
+        }
+        if (app.next_window_y) |y| {
+            init_y = y;
+            app.next_window_y = null;
+        }
+        app.mutex.unlock();
+    }
+    // Fall back to saved state if no cascade position
+    if (init_x == null or init_y == null) {
+        const saved_state = loadWindowState(allocator);
+        if (saved_state) |s| {
+            if (init_x == null) init_x = s.x;
+            if (init_y == null) init_y = s.y;
+        }
+    }
     var win32_window = win32_backend.Window.init(
         800,
         600,
         std.unicode.utf8ToUtf16LeStringLiteral("Phantty"),
-        if (saved_state) |s| s.x else null,
-        if (saved_state) |s| s.y else null,
+        init_x,
+        init_y,
     ) catch |err| {
         std.debug.print("Failed to create Win32 window: {}\n", .{err});
         return err;

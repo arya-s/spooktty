@@ -45,6 +45,10 @@ windows: std.ArrayListUnmanaged(*AppWindow),
 mutex: std.Thread.Mutex,
 window_threads: std.ArrayListUnmanaged(std.Thread),
 
+// Position for next spawned window (cascading)
+next_window_x: ?i32 = null,
+next_window_y: ?i32 = null,
+
 // ============================================================================
 // Initialization
 // ============================================================================
@@ -148,7 +152,19 @@ pub fn run(self: *App) !void {
 
 /// Request a new window to be spawned on a separate thread.
 /// Called from Ctrl+Shift+N in any window.
-pub fn requestNewWindow(self: *App) void {
+/// If parent_hwnd is provided, the new window will cascade from that position.
+pub fn requestNewWindow(self: *App, parent_hwnd: ?win32_backend.HWND) void {
+    // Get parent window position for cascading
+    if (parent_hwnd) |hwnd| {
+        var rect: win32_backend.RECT = undefined;
+        if (win32_backend.GetWindowRect(hwnd, &rect) != 0) {
+            self.mutex.lock();
+            self.next_window_x = rect.left + 30;
+            self.next_window_y = rect.top + 30;
+            self.mutex.unlock();
+        }
+    }
+
     const thread = std.Thread.spawn(.{}, windowThreadMain, .{self}) catch |err| {
         std.debug.print("Failed to spawn window thread: {}\n", .{err});
         return;
@@ -236,6 +252,24 @@ fn joinAllWindowThreads(self: *App) void {
 
     for (threads) |thread| {
         thread.join();
+    }
+}
+
+// ============================================================================
+// Shutdown
+// ============================================================================
+
+/// Request all windows to close. Posts WM_CLOSE to each window's HWND.
+/// Windows will exit their run loops and threads will terminate.
+pub fn requestShutdown(self: *App) void {
+    self.mutex.lock();
+    defer self.mutex.unlock();
+
+    for (self.windows.items) |window| {
+        if (window.getHwnd()) |hwnd| {
+            // Post WM_CLOSE (0x0010) to the window
+            _ = win32_backend.PostMessageW(hwnd, 0x0010, 0, 0);
+        }
     }
 }
 
