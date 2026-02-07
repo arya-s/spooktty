@@ -3469,7 +3469,7 @@ fn rebuildCells() void {
 /// Determine effective cursor style (factoring in blink and focus).
 /// Returns null during blink-off phase (cursor hidden).
 fn cursorEffectiveStyle(terminal_style: TerminalCursorStyle, terminal_blink: bool) ?CursorStyle {
-    if (!window_focused) return .block_hollow;
+    if (!window_focused or g_tab_rename_active) return .block_hollow;
     const should_blink = terminal_blink and g_cursor_blink;
     if (should_blink and !g_cursor_blink_visible) return null;
     return switch (terminal_style) {
@@ -3639,7 +3639,7 @@ fn drawCells(window_height: f32, offset_x: f32, offset_y: f32) void {
 
     // --- Cursor overlay from cached state ---
     if (g_cached_viewport_at_bottom and g_cached_cursor_visible) {
-        const effective = if (!window_focused)
+        const effective = if (!window_focused or g_tab_rename_active)
             CursorStyle.block_hollow
         else if (g_cursor_blink and !g_cursor_blink_visible)
             null
