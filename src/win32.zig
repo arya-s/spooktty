@@ -814,7 +814,8 @@ fn adjustWindowRectEx(rect: *RECT, style: DWORD, menu: BOOL, ex_style: DWORD) vo
 // ============================================================================
 
 // Global pointer to the active window (for the WndProc callback)
-var g_win32_window: ?*Window = null;
+// Thread-local so each window thread has its own pointer
+threadlocal var g_win32_window: ?*Window = null;
 
 /// Set the global window pointer so WndProc can update it.
 pub fn setGlobalWindow(w: *Window) void {
