@@ -10,6 +10,8 @@ const AppWindow = @import("AppWindow.zig");
 const directwrite = @import("directwrite.zig");
 const win32_backend = @import("win32.zig");
 
+extern "user32" fn MonitorFromPoint(pt: win32_backend.POINT, dwFlags: u32) callconv(.winapi) ?win32_backend.HMONITOR;
+
 const App = @This();
 
 // ============================================================================
@@ -117,17 +119,19 @@ pub fn getShellCmd(self: *const App) [:0]const u16 {
     return self.shell_cmd_buf[0..self.shell_cmd_len :0];
 }
 
-/// Take the initial CWD for a new window (clears it after reading).
-/// Returns null if no CWD was set.
-pub fn takeInitialCwd(self: *App) ?[*:0]const u16 {
+/// Take the initial CWD for a new window (copies into provided buffer, clears source).
+/// Returns the length of the CWD, or 0 if no CWD was set.
+pub fn takeInitialCwd(self: *App, out_buf: *[260]u16) usize {
     self.mutex.lock();
     defer self.mutex.unlock();
 
-    if (self.next_window_cwd_len == 0) return null;
+    if (self.next_window_cwd_len == 0) return 0;
 
     const len = self.next_window_cwd_len;
+    @memcpy(out_buf[0..len], self.next_window_cwd[0..len]);
+    out_buf[len] = 0;
     self.next_window_cwd_len = 0;
-    return self.next_window_cwd[0..len :0];
+    return len;
 }
 
 // ============================================================================
@@ -178,8 +182,16 @@ pub fn requestNewWindow(self: *App, parent_hwnd: ?win32_backend.HWND, cwd: ?[]co
     if (parent_hwnd) |hwnd| {
         var rect: win32_backend.RECT = undefined;
         if (win32_backend.GetWindowRect(hwnd, &rect) != 0) {
-            self.next_window_x = rect.left + 30;
-            self.next_window_y = rect.top + 30;
+            const new_x = rect.left + 30;
+            const new_y = rect.top + 30;
+            // Validate that the new position is on a visible monitor
+            const pt = win32_backend.POINT{ .x = new_x + 50, .y = new_y + 50 };
+            const monitor = MonitorFromPoint(pt, 0); // MONITOR_DEFAULTTONULL
+            if (monitor != null) {
+                self.next_window_x = new_x;
+                self.next_window_y = new_y;
+            }
+            // If off-screen, don't set position - window will use default
         }
     }
 

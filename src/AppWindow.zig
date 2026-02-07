@@ -69,8 +69,8 @@ pub fn init(allocator: std.mem.Allocator, app: *App) !AppWindow {
     g_font_size = app.font_size;
     g_shader_path = app.shader_path;
 
-    // Get initial CWD for this window (if any)
-    g_initial_cwd = app.takeInitialCwd();
+    // Get initial CWD for this window (if any) - copy into thread-local buffer
+    g_initial_cwd_len = app.takeInitialCwd(&g_initial_cwd_buf);
 
     return AppWindow{
         .allocator = allocator,
@@ -113,7 +113,8 @@ pub fn deinit(self: *AppWindow) void {
 threadlocal var g_app: ?*App = null;
 
 // Initial CWD for this window (used when spawning the first tab)
-threadlocal var g_initial_cwd: ?[*:0]const u16 = null;
+threadlocal var g_initial_cwd_buf: [260]u16 = undefined;
+threadlocal var g_initial_cwd_len: usize = 0;
 
 // Stored config values for deferred initialization
 threadlocal var g_requested_font: []const u8 = "";
@@ -126,6 +127,142 @@ threadlocal var g_theme: Theme = Theme.default();
 /// Convert FreeType 26.6 fixed-point to f64 (like Ghostty)
 fn f26dot6ToF64(v: anytype) f64 {
     return @as(f64, @floatFromInt(v)) / 64.0;
+}
+
+/// Convert a Unix-style path to a Windows path (UTF-16).
+/// Handles:
+///   /mnt/c/Users/... -> C:\Users\...
+///   /home/user/...   -> \\wsl.localhost\<distro>\home\user\...
+/// Returns the length of the converted path, or null if conversion failed.
+fn unixPathToWindows(unix_path: []const u8, out: *[260]u16) ?usize {
+    // Handle WSL /mnt/X/... paths (Windows drives mounted in WSL)
+    if (unix_path.len >= 7 and std.mem.startsWith(u8, unix_path, "/mnt/")) {
+        const drive_letter = unix_path[5];
+        if (drive_letter >= 'a' and drive_letter <= 'z') {
+            // Convert /mnt/c/foo/bar -> C:\foo\bar
+            out[0] = std.ascii.toUpper(drive_letter);
+            out[1] = ':';
+            var out_idx: usize = 2;
+
+            // Copy the rest of the path, converting / to \
+            const rest = unix_path[6..]; // Skip "/mnt/c"
+            for (rest) |ch| {
+                if (out_idx >= out.len - 1) break;
+                out[out_idx] = if (ch == '/') '\\' else ch;
+                out_idx += 1;
+            }
+            out[out_idx] = 0;
+            return out_idx;
+        }
+    }
+
+    // Handle pure Linux paths (e.g., /home/user) via \\wsl.localhost\<distro>\path
+    if (unix_path.len > 0 and unix_path[0] == '/') {
+        // Try to get distro name from OSC 7 hostname (file://hostname/path)
+        // or fall back to querying WSL for the default distro
+        const distro = getWslDistroName() orelse return null;
+
+        // Build \\wsl.localhost\<distro><path>
+        const prefix = "\\\\wsl.localhost\\";
+        var out_idx: usize = 0;
+
+        // Write prefix
+        for (prefix) |ch| {
+            if (out_idx >= out.len - 1) return null;
+            out[out_idx] = ch;
+            out_idx += 1;
+        }
+
+        // Write distro name
+        for (distro) |ch| {
+            if (out_idx >= out.len - 1) return null;
+            out[out_idx] = ch;
+            out_idx += 1;
+        }
+
+        // Write path, converting / to \
+        for (unix_path) |ch| {
+            if (out_idx >= out.len - 1) break;
+            out[out_idx] = if (ch == '/') '\\' else ch;
+            out_idx += 1;
+        }
+
+        out[out_idx] = 0;
+        return out_idx;
+    }
+
+    return null;
+}
+
+/// Get the WSL distro name by running `wsl.exe --list --quiet` and taking the first line.
+/// Returns a static buffer with the distro name, or null if detection failed.
+fn getWslDistroName() ?[]const u8 {
+    const Static = struct {
+        threadlocal var cached: bool = false;
+        threadlocal var distro_buf: [64]u8 = undefined;
+        threadlocal var distro_len: usize = 0;
+    };
+
+    // Return cached result if available
+    if (Static.cached) {
+        if (Static.distro_len > 0) {
+            return Static.distro_buf[0..Static.distro_len];
+        }
+        return null;
+    }
+    Static.cached = true;
+
+    // Run wsl.exe --list --quiet to get distro names
+    const allocator = g_allocator orelse return null;
+
+    var child = std.process.Child.init(&.{ "wsl.exe", "--list", "--quiet" }, allocator);
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Ignore;
+
+    child.spawn() catch return null;
+
+    // Read first line of output (default/first distro)
+    const stdout = child.stdout orelse return null;
+    var buf: [256]u8 = undefined;
+    const n = stdout.read(&buf) catch 0;
+
+    _ = child.wait() catch {};
+
+    if (n == 0) return null;
+
+    // WSL outputs UTF-16LE, convert to UTF-8
+    // Find first line (up to \r\n or \n)
+    var i: usize = 0;
+    var out_idx: usize = 0;
+    while (i + 1 < n and out_idx < Static.distro_buf.len) {
+        const lo = buf[i];
+        const hi = buf[i + 1];
+
+        // Skip BOM if present
+        if (i == 0 and lo == 0xFF and hi == 0xFE) {
+            i += 2;
+            continue;
+        }
+
+        // End of line?
+        if (lo == '\r' or lo == '\n' or lo == 0) break;
+
+        // ASCII character (hi should be 0 for ASCII)
+        if (hi == 0 and lo >= 0x20 and lo < 0x7F) {
+            Static.distro_buf[out_idx] = lo;
+            out_idx += 1;
+        }
+
+        i += 2;
+    }
+
+    if (out_idx > 0) {
+        Static.distro_len = out_idx;
+        std.debug.print("Detected WSL distro: {s}\n", .{Static.distro_buf[0..out_idx]});
+        return Static.distro_buf[0..out_idx];
+    }
+
+    return null;
 }
 
 // Global pointers for callbacks
@@ -263,9 +400,20 @@ fn spawnTabWithCwd(allocator: std.mem.Allocator, cwd: ?[*:0]const u16) bool {
     return true;
 }
 
-/// Spawn a new tab with default CWD (no inheritance).
+/// Spawn a new tab, inheriting CWD from the active tab if available.
 fn spawnTab(allocator: std.mem.Allocator) bool {
-    return spawnTabWithCwd(allocator, null);
+    // Get CWD from active tab for working directory inheritance
+    var cwd_buf: [260]u16 = undefined;
+    var cwd: ?[*:0]const u16 = null;
+    if (activeSurface()) |surface| {
+        if (surface.getCwd()) |unix_path| {
+            if (unixPathToWindows(unix_path, &cwd_buf)) |len| {
+                cwd_buf[len] = 0;
+                cwd = @ptrCast(&cwd_buf);
+            }
+        }
+    }
+    return spawnTabWithCwd(allocator, cwd);
 }
 
 fn closeTab(idx: usize) void {
@@ -634,7 +782,23 @@ fn loadWindowState(allocator: std.mem.Allocator) ?WindowState {
     }
 
     if (!has_x or !has_y) return null;
+
+    // Validate that the position is on a visible monitor
+    // Use MonitorFromPoint with MONITOR_DEFAULTTONULL - returns null if point is off-screen
+    const pt = win32_backend.POINT{ .x = state.x + 50, .y = state.y + 50 }; // Check a point inside the window
+    const monitor = monitorFromPoint(pt, 0); // MONITOR_DEFAULTTONULL = 0
+    if (monitor == null) {
+        std.debug.print("Saved window position ({}, {}) is off-screen, ignoring\n", .{ state.x, state.y });
+        return null;
+    }
+
     return state;
+}
+
+extern "user32" fn MonitorFromPoint(pt: win32_backend.POINT, dwFlags: u32) callconv(.winapi) ?win32_backend.HMONITOR;
+
+fn monitorFromPoint(pt: win32_backend.POINT, flags: u32) ?win32_backend.HMONITOR {
+    return MonitorFromPoint(pt, flags);
 }
 
 /// Save window state to the state file.
@@ -3914,8 +4078,28 @@ const win32_input = struct {
         if (ev.ctrl and ev.shift and ev.vk == 0x4E) { // 'N'
             if (g_app) |app| {
                 const hwnd = if (g_window) |w| w.hwnd else null;
-                // TODO: pass CWD from active tab for working directory inheritance
-                app.requestNewWindow(hwnd, null);
+                // Get CWD from active tab for working directory inheritance
+                var cwd_buf: [260]u16 = undefined;
+                var cwd: ?[]const u16 = null;
+                if (activeSurface()) |surface| {
+                    if (surface.getCwd()) |unix_path| {
+                        std.debug.print("CWD from OSC 7: {s}\n", .{unix_path});
+                        if (unixPathToWindows(unix_path, &cwd_buf)) |len| {
+                            cwd = cwd_buf[0..len];
+                            // Print the Windows path (convert u16 to u8 for printing)
+                            var path_u8: [260]u8 = undefined;
+                            for (cwd_buf[0..len], 0..) |wc, i| {
+                                path_u8[i] = @truncate(wc);
+                            }
+                            std.debug.print("Converted to Windows path: {s}\n", .{path_u8[0..len]});
+                        } else {
+                            std.debug.print("Failed to convert Unix path to Windows\n", .{});
+                        }
+                    } else {
+                        std.debug.print("No CWD from active surface (OSC 7 not received)\n", .{});
+                    }
+                }
+                app.requestNewWindow(hwnd, cwd);
             }
             return;
         }
@@ -4494,8 +4678,11 @@ fn runMainLoop(allocator: std.mem.Allocator) !void {
 
     // Spawn the initial tab (PTY + terminal)
     // Use the initial CWD if one was set (working directory inheritance)
-    const initial_cwd = g_initial_cwd;
-    g_initial_cwd = null; // Clear after use
+    const initial_cwd: ?[*:0]const u16 = if (g_initial_cwd_len > 0)
+        @ptrCast(&g_initial_cwd_buf)
+    else
+        null;
+    g_initial_cwd_len = 0; // Clear after use
     if (!spawnTabWithCwd(allocator, initial_cwd)) {
         std.debug.print("Failed to spawn initial tab\n", .{});
         return error.SpawnFailed;

@@ -88,6 +88,10 @@ osc7_title: [256]u8 = undefined,
 osc7_title_len: usize = 0,
 got_osc7_this_batch: bool = false,
 
+// Raw CWD path from OSC 7 (Unix-style, e.g., "/home/user/dir")
+cwd_path: [512]u8 = undefined,
+cwd_path_len: usize = 0,
+
 // ============================================================================
 // Lifecycle
 // ============================================================================
@@ -148,6 +152,7 @@ pub fn init(
     surface.osc_buf_len = 0;
     surface.osc7_title_len = 0;
     surface.got_osc7_this_batch = false;
+    surface.cwd_path_len = 0;
 
     // Spawn IO thread — must be last, after all state is initialized.
     // The thread starts reading from the PTY immediately.
@@ -200,6 +205,14 @@ pub fn getTitle(self: *const Surface) []const u8 {
     if (self.window_title_len > 0)
         return self.window_title[0..self.window_title_len];
     return "phantty";
+}
+
+/// Get the current working directory path (from OSC 7), or null if not set.
+/// Returns a Unix-style path (e.g., "/home/user/dir" or "/mnt/c/Users/...").
+pub fn getCwd(self: *const Surface) ?[]const u8 {
+    if (self.cwd_path_len > 0)
+        return self.cwd_path[0..self.cwd_path_len];
+    return null;
 }
 
 /// Reset OSC batch state — call before each PTY read batch.
@@ -306,6 +319,12 @@ fn updateTitle(self: *Surface, title: []const u8, osc_num: u8) void {
             if (std.mem.indexOfScalar(u8, after_prefix, '/')) |slash| {
                 const path = after_prefix[slash..];
 
+                // Store raw path for CWD inheritance
+                const raw_len = @min(path.len, self.cwd_path.len);
+                @memcpy(self.cwd_path[0..raw_len], path[0..raw_len]);
+                self.cwd_path_len = raw_len;
+
+                // Format for display (with ~ for home)
                 const home_prefix = "/home/";
                 if (std.mem.startsWith(u8, path, home_prefix)) {
                     const after_home = path[home_prefix.len..];

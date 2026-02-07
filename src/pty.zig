@@ -124,6 +124,18 @@ pub const Pty = struct {
     rows: u16,
 
     pub fn spawn(cols: u16, rows: u16, command: [*:0]const u16, cwd: ?[*:0]const u16) !Pty {
+        // Debug: print CWD if provided
+        if (cwd) |dir| {
+            var cwd_u8: [260]u8 = undefined;
+            var len: usize = 0;
+            while (dir[len] != 0 and len < 260) : (len += 1) {
+                cwd_u8[len] = @truncate(dir[len]);
+            }
+            std.debug.print("PTY spawn with CWD: {s}\n", .{cwd_u8[0..len]});
+        } else {
+            std.debug.print("PTY spawn with no CWD\n", .{});
+        }
+
         var self: Pty = undefined;
         self.cols = cols;
         self.rows = rows;
