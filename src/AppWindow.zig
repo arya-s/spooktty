@@ -4670,28 +4670,9 @@ const win32_input = struct {
     }
 
     fn handleKey(ev: win32_backend.KeyEvent) void {
-        // When tab rename is active, handle special keys
-        if (g_tab_rename_active) {
-            handleRenameKey(ev);
-            return;
-        }
-        // Ctrl+Shift+C = copy
-        if (ev.ctrl and ev.shift and ev.vk == 0x43) { // 'C'
-            copySelectionToClipboard();
-            return;
-        }
-        // Ctrl+Shift+V = paste
-        if (ev.ctrl and ev.shift and ev.vk == 0x56) { // 'V'
-            pasteFromClipboard();
-            return;
-        }
-        // Ctrl+Shift+T = new tab
-        if (ev.ctrl and ev.shift and ev.vk == 0x54) { // 'T'
-            _ = spawnTab(g_allocator orelse return);
-            return;
-        }
-        // Ctrl+Shift+N = new window
+        // Ctrl+Shift+N = new window (even during tab rename)
         if (ev.ctrl and ev.shift and ev.vk == 0x4E) { // 'N'
+            if (g_tab_rename_active) commitTabRename();
             if (g_app) |app| {
                 const hwnd = if (g_window) |w| w.hwnd else null;
                 // Get CWD from active tab for working directory inheritance
@@ -4702,7 +4683,6 @@ const win32_input = struct {
                         std.debug.print("CWD from OSC 7: {s}\n", .{unix_path});
                         if (unixPathToWindows(unix_path, &cwd_buf)) |len| {
                             cwd = cwd_buf[0..len];
-                            // Print the Windows path (convert u16 to u8 for printing)
                             var path_u8: [260]u8 = undefined;
                             for (cwd_buf[0..len], 0..) |wc, i| {
                                 path_u8[i] = @truncate(wc);
@@ -4719,6 +4699,28 @@ const win32_input = struct {
             }
             return;
         }
+        // Ctrl+Shift+T = new tab (even during tab rename)
+        if (ev.ctrl and ev.shift and ev.vk == 0x54) { // 'T'
+            if (g_tab_rename_active) commitTabRename();
+            _ = spawnTab(g_allocator orelse return);
+            return;
+        }
+        // When tab rename is active, handle special keys
+        if (g_tab_rename_active) {
+            handleRenameKey(ev);
+            return;
+        }
+        // Ctrl+Shift+C = copy
+        if (ev.ctrl and ev.shift and ev.vk == 0x43) { // 'C'
+            copySelectionToClipboard();
+            return;
+        }
+        // Ctrl+Shift+V = paste
+        if (ev.ctrl and ev.shift and ev.vk == 0x56) { // 'V'
+            pasteFromClipboard();
+            return;
+        }
+        // Ctrl+Shift+T and Ctrl+Shift+N are handled above (before rename guard)
         // Ctrl+W = close tab, or close app if only 1 tab
         if (ev.ctrl and ev.vk == 0x57) { // 'W'
             if (g_tab_count <= 1) {
