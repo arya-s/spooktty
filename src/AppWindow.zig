@@ -858,6 +858,7 @@ threadlocal var g_fps_value: f32 = 0; // Current FPS value to display
 threadlocal var g_ft_lib: ?freetype.Library = null;
 threadlocal var g_font_discovery: ?*directwrite.FontDiscovery = null;
 threadlocal var g_fallback_faces: std.AutoHashMapUnmanaged(u32, freetype.Face) = .empty; // codepoint -> fallback face
+threadlocal var g_no_fallback: std.AutoHashMapUnmanaged(u32, void) = .empty; // codepoints with no fallback (negative cache)
 threadlocal var g_font_size: u32 = DEFAULT_FONT_SIZE;
 
 // HarfBuzz shaping state
@@ -1535,13 +1536,26 @@ fn findOrLoadFallbackFace(codepoint: u32, alloc: std.mem.Allocator) ?freetype.Fa
         return face;
     }
 
+    // Check negative cache - if we already know there's no fallback, skip DirectWrite
+    if (g_no_fallback.contains(codepoint)) {
+        return null;
+    }
+
     // Need DirectWrite and FreeType library to find fallbacks
     const dw = g_font_discovery orelse return null;
     const ft_lib = g_ft_lib orelse return null;
 
     // Use DirectWrite to find a font with this codepoint
-    const maybe_font = dw.findFallbackFont(codepoint) catch return null;
-    const font = maybe_font orelse return null;
+    const maybe_font = dw.findFallbackFont(codepoint) catch {
+        // Cache the negative result to avoid repeated DirectWrite queries
+        g_no_fallback.put(alloc, codepoint, {}) catch {};
+        return null;
+    };
+    const font = maybe_font orelse {
+        // Cache the negative result
+        g_no_fallback.put(alloc, codepoint, {}) catch {};
+        return null;
+    };
     defer font.release();
 
     // Get the font face to extract file path
@@ -1578,8 +1592,6 @@ fn findOrLoadFallbackFace(codepoint: u32, alloc: std.mem.Allocator) ?freetype.Fa
     defer alloc.free(utf8_path);
 
     const face_index = dw_face.getIndex();
-
-    std.debug.print("Loading fallback font for U+{X:0>4}: {s}\n", .{ codepoint, utf8_path });
 
     // Load with FreeType
     const ft_face = ft_lib.initFace(utf8_path, @intCast(face_index)) catch return null;
@@ -3678,6 +3690,10 @@ fn clearFallbackFaces(allocator: std.mem.Allocator) void {
     }
     g_fallback_faces.deinit(allocator);
     g_fallback_faces = .empty;
+
+    // Also clear negative cache
+    g_no_fallback.deinit(allocator);
+    g_no_fallback = .empty;
 
     // Clean up HarfBuzz fallback fonts
     var hb_it = g_hb_fallback_fonts.iterator();
