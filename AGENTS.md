@@ -6,6 +6,13 @@ Phantty is a Windows terminal emulator written in Zig. It uses [libghostty-vt](h
 
 This is a **Windows-only** project. It cross-compiles from Linux targeting `x86_64-windows`.
 
+## Hard Rules
+
+When working on implementing a plan from the plans directory:
+ * never deviate from the plan without asking for clear consent
+ * never deem something too big and choosing not to do it in the name of pragmatism
+ * always ask if you have trouble because something is too big, we will break it down together and work on it step by step
+
 ## Build Commands
 
 ```bash
