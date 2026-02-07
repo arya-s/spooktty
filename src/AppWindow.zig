@@ -4067,6 +4067,12 @@ const win32_input = struct {
 
     fn handleChar(ev: win32_backend.CharEvent) void {
         if (!isActiveTabTerminal()) return;
+        // Skip chars when Alt is held without Ctrl — those are part of Alt+key
+        // combos (e.g. Shift+Alt+4) and shouldn't produce text input.
+        // However, AltGr on international keyboards reports as Ctrl+Alt, so
+        // we must allow chars when both Ctrl and Alt are held (AltGr chars).
+        // This matches Ghostty's consumed_mods / effectiveMods approach.
+        if (ev.alt and !ev.ctrl) return;
         const surface = activeSurface() orelse return;
         resetCursorBlink();
         {
@@ -4167,15 +4173,10 @@ const win32_input = struct {
         const surface = activeSurface() orelse return;
         const pty = &surface.pty;
 
-        // Don't reset blink / scroll-to-bottom for scroll keys or pure modifiers
-        const is_scroll_key = ev.shift and (ev.vk == win32_backend.VK_PRIOR or ev.vk == win32_backend.VK_NEXT);
-        const is_modifier = ev.vk == win32_backend.VK_SHIFT or ev.vk == win32_backend.VK_CONTROL or ev.vk == win32_backend.VK_MENU;
-        if (!is_scroll_key and !is_modifier) {
-            resetCursorBlink();
-            surface.render_state.mutex.lock();
-            surface.terminal.scrollViewport(.bottom) catch {};
-            surface.render_state.mutex.unlock();
-        }
+        // Track whether this keypress actually sends data to the PTY.
+        // Like Ghostty, we only scroll-to-bottom when input is actually generated,
+        // not for modifier-only keys or key combos that don't produce PTY output.
+        var wrote_to_pty = false;
 
         const seq: ?[]const u8 = switch (ev.vk) {
             win32_backend.VK_RETURN => "\r",
@@ -4221,13 +4222,28 @@ const win32_input = struct {
                     if (!ev.shift) {
                         const ctrl_char: u8 = @intCast(ev.vk - 0x41 + 1);
                         _ = pty.write(&[_]u8{ctrl_char}) catch {};
+                        wrote_to_pty = true;
                     }
                 }
                 break :blk null;
             },
         };
 
-        if (seq) |s| _ = pty.write(s) catch {};
+        if (seq) |s| {
+            _ = pty.write(s) catch {};
+            wrote_to_pty = true;
+        }
+
+        // Only scroll to bottom and reset cursor blink when we actually sent
+        // data to the PTY. This matches Ghostty's behavior: modifier-only keys,
+        // unbound key combos (like Shift+Alt+4), and scroll keys don't snap
+        // the viewport to the bottom.
+        if (wrote_to_pty) {
+            resetCursorBlink();
+            surface.render_state.mutex.lock();
+            surface.terminal.scrollViewport(.bottom) catch {};
+            surface.render_state.mutex.unlock();
+        }
     }
 
     var plus_btn_pressed: bool = false;

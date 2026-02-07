@@ -242,6 +242,17 @@ pub const VK_DELETE: WPARAM = 0x2E;
 pub const VK_SHIFT: WPARAM = 0x10;
 pub const VK_CONTROL: WPARAM = 0x11;
 pub const VK_MENU: WPARAM = 0x12; // Alt
+pub const VK_CAPITAL: WPARAM = 0x14; // Caps Lock
+pub const VK_LWIN: WPARAM = 0x5B;
+pub const VK_RWIN: WPARAM = 0x5C;
+pub const VK_NUMLOCK: WPARAM = 0x90;
+pub const VK_SCROLL: WPARAM = 0x91;
+pub const VK_LSHIFT: WPARAM = 0xA0;
+pub const VK_RSHIFT: WPARAM = 0xA1;
+pub const VK_LCONTROL: WPARAM = 0xA2;
+pub const VK_RCONTROL: WPARAM = 0xA3;
+pub const VK_LMENU: WPARAM = 0xA4; // Left Alt
+pub const VK_RMENU: WPARAM = 0xA5; // Right Alt
 pub const VK_OEM_COMMA: WPARAM = 0xBC;
 pub const VK_F11: WPARAM = 0x7A;
 
@@ -398,6 +409,9 @@ pub const KeyEvent = struct {
 /// Character input events (text via WM_CHAR, after TranslateMessage)
 pub const CharEvent = struct {
     codepoint: u21,
+    ctrl: bool = false,
+    shift: bool = false,
+    alt: bool = false,
 };
 
 /// Mouse button events
@@ -1110,8 +1124,12 @@ fn wndProc(hwnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.wina
             const char_code: u16 = @intCast(wParam & 0xFFFF);
             // Skip control characters — those come through WM_KEYDOWN
             if (char_code >= 32) {
+                const mods = getModifiers();
                 w.char_events.push(.{
                     .codepoint = @intCast(char_code),
+                    .ctrl = mods.ctrl,
+                    .shift = mods.shift,
+                    .alt = mods.alt,
                 });
             }
             return 0;
